@@ -1,0 +1,2 @@
+numpy
+usd-core==26.8

@@ -1,0 +1,21 @@
+# Generated simulation results and profiling output
+/output/
+/archive/*.npz
+/archive/*.csv
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Packaged releases and Blender backup files
+*.zip
+*.blend[0-9]*
+
+# Local editor and operating-system files
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store

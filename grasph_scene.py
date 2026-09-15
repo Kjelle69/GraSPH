@@ -1,0 +1,372 @@
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+from pxr import Usd, UsdGeom, Gf
+
+
+@dataclass
+class MeshData:
+    path: str
+    vertices: np.ndarray
+    triangles: np.ndarray
+    bounds_min: np.ndarray
+    bounds_max: np.ndarray
+
+
+@dataclass
+class SceneData:
+    stage: object
+    fluid_sources: list
+    colliders: list
+    source_file: str
+    start_time_code: float
+    end_time_code: float
+    time_codes_per_second: float
+    frames_per_second: float
+    reference_linear: dict
+    reference_translation: dict
+    motion_time_codes: dict
+    motion_translations: dict
+    motion_driver_paths: dict
+
+    def sim_seconds_to_time_code(self, t_seconds):
+        return float(self.start_time_code + float(t_seconds) * self.time_codes_per_second)
+
+    def collider_motion(self, t_seconds, linear_tol=1.0e-6):
+        """Return translation deltas from the reference pose.
+
+        FIX3 uses a motion table sampled from the composed USD stage at load
+        time.  This deliberately decouples the solver loop from Blender's
+        authored xform-op layout (parent Xform, matrix op, translate op, etc.)
+        and makes the exact motion used by physics inspectable before a long run.
+        """
+        tc = self.sim_seconds_to_time_code(t_seconds)
+        out = {}
+        for mesh in self.colliders:
+            times = self.motion_time_codes.get(mesh.path)
+            vals = self.motion_translations.get(mesh.path)
+            if times is None or vals is None or len(times) == 0:
+                out[mesh.path] = np.zeros(3, dtype=np.float64)
+                continue
+            if tc <= times[0]:
+                out[mesh.path] = vals[0].copy()
+            elif tc >= times[-1]:
+                out[mesh.path] = vals[-1].copy()
+            else:
+                k = int(np.searchsorted(times, tc, side="right"))
+                t0, t1 = float(times[k-1]), float(times[k])
+                a = 0.0 if abs(t1-t0) < 1e-15 else (tc-t0)/(t1-t0)
+                out[mesh.path] = (1.0-a)*vals[k-1] + a*vals[k]
+        return out
+
+    def animated_collider_paths(self, tol=1.0e-10):
+        paths = []
+        for mesh in self.colliders:
+            vals = self.motion_translations.get(mesh.path)
+            if vals is not None and len(vals) and float(np.max(np.linalg.norm(vals, axis=1))) > tol:
+                paths.append(mesh.path)
+        return paths
+
+    def print_motion_preflight(self):
+        print()
+        print("========================================")
+        print("USD KINEMATIC PREFLIGHT (FIX3)")
+        print("========================================")
+        animated = self.animated_collider_paths()
+        if not animated:
+            print("Animated colliders: NONE")
+            print("Physics will treat every collider as static.")
+            return
+        span = max(0.0, (self.end_time_code-self.start_time_code)/self.time_codes_per_second)
+        probes = [0.0, .25*span, .5*span, .75*span, span]
+        print(f"Animated colliders: {len(animated)}")
+        print(f"Source span       : {span:.6f} s")
+        for path in animated:
+            print(f"  {path}")
+            driver = self.motion_driver_paths.get(path, path)
+            print(f"    xform driver : {driver}")
+            for tt in probes:
+                d = self.collider_motion(tt)[path]
+                print(f"    t={tt:8.4f}s  d=({d[0]:+.6f}, {d[1]:+.6f}, {d[2]:+.6f}) m")
+
+
+
+def _world_points(mesh_prim, time_code):
+    mesh = UsdGeom.Mesh(mesh_prim)
+    points = mesh.GetPointsAttr().Get(time_code) or []
+    xcache = UsdGeom.XformCache(time_code)
+    xf = xcache.GetLocalToWorldTransform(mesh_prim)
+    out = []
+    for p in points:
+        wp = xf.Transform(Gf.Vec3d(float(p[0]), float(p[1]), float(p[2])))
+        out.append((float(wp[0]), float(wp[1]), float(wp[2])))
+    return np.asarray(out, dtype=np.float64)
+
+
+def _triangulate(mesh_prim, vertices, time_code):
+    mesh = UsdGeom.Mesh(mesh_prim)
+    counts = mesh.GetFaceVertexCountsAttr().Get(time_code) or []
+    indices = mesh.GetFaceVertexIndicesAttr().Get(time_code) or []
+    triangles = []
+    cursor = 0
+    for count in counts:
+        count = int(count)
+        face = [int(v) for v in indices[cursor:cursor + count]]
+        cursor += count
+        if count < 3:
+            continue
+        i0 = face[0]
+        for k in range(1, count - 1):
+            triangles.append((vertices[i0], vertices[face[k]], vertices[face[k + 1]]))
+    if not triangles:
+        return np.empty((0, 3, 3), dtype=np.float64)
+    return np.asarray(triangles, dtype=np.float64)
+
+
+def _role_for_prim(prim):
+    attr = prim.GetAttribute("grasph:role")
+    if attr and attr.HasAuthoredValueOpinion():
+        value = attr.Get()
+        if value is not None:
+            return str(value).strip().lower()
+
+    parts = [p.lower() for p in str(prim.GetPath()).split("/") if p]
+    if any(p == "fluidvolume" or p.startswith("fluidvolume") for p in parts):
+        return "fluid"
+    return "collider"
+
+
+def _matrix_parts(xf):
+    linear = np.array([[float(xf[i][j]) for j in range(3)] for i in range(3)], dtype=np.float64)
+    tr = xf.ExtractTranslation()
+    translation = np.array([float(tr[0]), float(tr[1]), float(tr[2])], dtype=np.float64)
+    return linear, translation
+
+
+def _xform_has_time_samples(prim):
+    try:
+        xf = UsdGeom.Xformable(prim)
+        if not xf:
+            return False
+        for op in xf.GetOrderedXformOps():
+            attr = op.GetAttr()
+            try:
+                if attr.GetNumTimeSamples() > 0:
+                    return True
+            except Exception:
+                pass
+            try:
+                if attr.ValueMightBeTimeVarying():
+                    return True
+            except Exception:
+                pass
+    except Exception:
+        return False
+    return False
+
+def _motion_driver_path(mesh_prim):
+    """Nearest ancestor (including self) carrying animated xform samples."""
+    p = mesh_prim
+    while p and p.IsValid():
+        if _xform_has_time_samples(p):
+            return str(p.GetPath())
+        p = p.GetParent()
+    return str(mesh_prim.GetPath())
+
+def _sample_motion_tables(stage, colliders, ref_linear, ref_translation, start_tc, end_tc, tps, fps, linear_tol=1e-6):
+    # Sample at source-frame cadence. Blender's USD exporter normally bakes
+    # object animation at this cadence, including parent-Xform animation.
+    frame_step = float(tps/fps) if fps > 0 else 1.0
+    if not np.isfinite(frame_step) or frame_step <= 0:
+        frame_step = 1.0
+    if end_tc <= start_tc + 1e-12:
+        sample_tcs = np.asarray([start_tc], dtype=np.float64)
+    else:
+        n = int(np.floor((end_tc-start_tc)/frame_step + 1e-9)) + 1
+        sample_tcs = start_tc + np.arange(n, dtype=np.float64)*frame_step
+        if sample_tcs[-1] < end_tc - 1e-9:
+            sample_tcs = np.append(sample_tcs, end_tc)
+        else:
+            sample_tcs[-1] = min(sample_tcs[-1], end_tc)
+
+    motion_times = {}
+    motion_vals = {}
+    driver_paths = {}
+    for mesh in colliders:
+        prim = stage.GetPrimAtPath(mesh.path)
+        driver_paths[mesh.path] = _motion_driver_path(prim)
+        vals=[]
+        for tc in sample_tcs:
+            cache=UsdGeom.XformCache(Usd.TimeCode(float(tc)))
+            xf=cache.GetLocalToWorldTransform(prim)
+            linear, tr = _matrix_parts(xf)
+            if np.max(np.abs(linear-ref_linear[mesh.path])) > linear_tol:
+                raise RuntimeError(
+                    f"Collider {mesh.path} changes rotation/scale in USD. "
+                    "FIX3 supports translation-only kinematics."
+                )
+            vals.append(tr-ref_translation[mesh.path])
+        motion_times[mesh.path]=sample_tcs.copy()
+        motion_vals[mesh.path]=np.asarray(vals,dtype=np.float64)
+    return motion_times, motion_vals, driver_paths
+
+
+def load_scene(usd_file):
+    usd_file = str(usd_file)
+    print()
+    print("========================================")
+    print("GraSPH SCENE LOADER")
+    print("========================================")
+    print()
+    print(f"Opening: {usd_file}")
+
+    stage = Usd.Stage.Open(usd_file)
+    if stage is None:
+        raise RuntimeError(f"Could not open USD stage: {usd_file}")
+
+    start_tc = float(stage.GetStartTimeCode())
+    end_tc = float(stage.GetEndTimeCode())
+    tps = float(stage.GetTimeCodesPerSecond())
+    fps = float(stage.GetFramesPerSecond())
+    if not np.isfinite(tps) or tps <= 0.0:
+        tps = 24.0
+    if not np.isfinite(fps) or fps <= 0.0:
+        fps = tps
+    ref_time = Usd.TimeCode(start_tc)
+
+    print(f"USD time range : {start_tc:g} .. {end_tc:g}")
+    print(f"USD fps/tps    : {fps:g} / {tps:g}")
+
+    fluid_sources = []
+    colliders = []
+    reference_linear = {}
+    reference_translation = {}
+
+    print()
+    print("Scanning scene...")
+    xcache = UsdGeom.XformCache(ref_time)
+    for prim in stage.Traverse():
+        if not prim.IsA(UsdGeom.Mesh):
+            continue
+        vertices = _world_points(prim, ref_time)
+        if len(vertices) == 0:
+            continue
+        triangles = _triangulate(prim, vertices, ref_time)
+        bmin = np.min(vertices, axis=0)
+        bmax = np.max(vertices, axis=0)
+        data = MeshData(
+            path=str(prim.GetPath()),
+            vertices=vertices,
+            triangles=triangles,
+            bounds_min=bmin,
+            bounds_max=bmax,
+        )
+        role = _role_for_prim(prim)
+        if role in ("fluid", "source", "fluid_source"):
+            fluid_sources.append(data)
+            label = "FLUID SOURCE"
+        elif role in ("ignore", "visual", "disabled"):
+            continue
+        else:
+            colliders.append(data)
+            label = "COLLIDER"
+            xf = xcache.GetLocalToWorldTransform(prim)
+            linear, translation = _matrix_parts(xf)
+            reference_linear[data.path] = linear
+            reference_translation[data.path] = translation
+
+        print(f"  {label:<13}: {data.path}" + (f" ({len(triangles)} triangles)" if label == "COLLIDER" else ""))
+        if label == "FLUID SOURCE":
+            size = bmax - bmin
+            print(f"      min  : {bmin}")
+            print(f"      max  : {bmax}")
+            print(f"      size : {size}")
+
+    print()
+    print(f"Fluid sources : {len(fluid_sources)}")
+    print(f"Collider meshes: {len(colliders)}")
+
+    scene = SceneData(
+        stage=stage,
+        fluid_sources=fluid_sources,
+        colliders=colliders,
+        source_file=str(Path(usd_file)),
+        start_time_code=start_tc,
+        end_time_code=end_tc,
+        time_codes_per_second=tps,
+        frames_per_second=fps,
+        reference_linear=reference_linear,
+        reference_translation=reference_translation,
+        motion_time_codes={},
+        motion_translations={},
+        motion_driver_paths={},
+    )
+
+    motion_t, motion_v, motion_drivers = _sample_motion_tables(
+        stage, colliders, reference_linear, reference_translation,
+        start_tc, end_tc, tps, fps,
+    )
+    scene.motion_time_codes = motion_t
+    scene.motion_translations = motion_v
+    scene.motion_driver_paths = motion_drivers
+    scene.print_motion_preflight()
+
+    # Table-based animation summary used by the solver itself.
+    animated = scene.animated_collider_paths()
+    if animated:
+        print("Animated/kinematic colliders used by PHYSICS:")
+        for pth in animated:
+            travel=float(np.max(np.linalg.norm(scene.motion_translations[pth],axis=1)))
+            print(f"  {pth}  max travel={travel:.6f} m")
+    else:
+        print("WARNING: no collider motion was found in the composed USD stage.")
+
+    return scene
+
+
+def _axis_centers(lo, hi, dp):
+    start = float(lo) + 0.5 * float(dp)
+    stop = float(hi) - 0.5 * float(dp)
+    if stop < start - 1.0e-12:
+        return np.empty(0, dtype=np.float64)
+    n = int(np.floor((stop - start) / float(dp) + 1.0e-9)) + 1
+    return start + np.arange(n, dtype=np.float64) * float(dp)
+
+
+def generate_fluid_particles(scene, dp):
+    """Spawn regular particles from FluidVolume world-space AABBs at USD start time."""
+    dp = float(dp)
+    parts = []
+
+    print()
+    print("Generating fluid particles...")
+    for source in scene.fluid_sources:
+        xs = _axis_centers(source.bounds_min[0], source.bounds_max[0], dp)
+        ys = _axis_centers(source.bounds_min[1], source.bounds_max[1], dp)
+        zs = _axis_centers(source.bounds_min[2], source.bounds_max[2], dp)
+        if len(xs) == 0 or len(ys) == 0 or len(zs) == 0:
+            pos = np.empty((0, 3), dtype=np.float64)
+        else:
+            X, Y, Z = np.meshgrid(xs, ys, zs, indexing="ij")
+            pos = np.column_stack((X.ravel(), Y.ravel(), Z.ravel()))
+        parts.append(pos)
+        print()
+        print(f"  {source.path}")
+        print(f"      particles : {len(pos)}")
+        print(f"      grid      : {len(xs)} x {len(ys)} x {len(zs)}")
+
+    if not parts:
+        out = np.empty((0, 3), dtype=np.float64)
+    elif len(parts) == 1:
+        out = parts[0]
+    else:
+        out = np.vstack(parts)
+        scale = max(dp * 1.0e-8, 1.0e-12)
+        keys = np.round(out / scale).astype(np.int64)
+        _, keep = np.unique(keys, axis=0, return_index=True)
+        out = out[np.sort(keep)]
+
+    print()
+    print(f"Total fluid particles: {len(out)}")
+    return out

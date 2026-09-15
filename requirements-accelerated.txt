@@ -1,0 +1,2 @@
+# Optional CPU acceleration for GraSPH FIX5 neighbor searches
+scipy>=1.11
