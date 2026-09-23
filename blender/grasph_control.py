@@ -5,7 +5,7 @@ The numerical solver is launched as a separate process; Blender remains the
 scene editor and result viewer.
 """
 
-ADDON_VERSION = (0, 5, 1)
+ADDON_VERSION = (0, 6, 0)
 
 
 bl_info = {
@@ -256,10 +256,10 @@ def validate_scene(scene):
             f"[{granular_names}] to Unassigned."
         )
     dynamic_bodies = [obj for obj in tagged if obj.grasph.role == "DYNAMIC_BODY"]
-    if fluid_objects and dynamic_bodies:
-        errors.append(
-            "Dynamic Body is currently supported by granular simulations only; "
-            "use Dynamic Hinge for the fluid solver."
+    if fluid_objects and dynamic_bodies and not scene.grasph_scene.enable_solid_coupling:
+        warnings.append(
+            "Dynamic Body objects remain fixed during fluid simulation until "
+            "Fluid / Solid Coupling is enabled in Advanced Settings."
         )
 
     for obj in tagged:
@@ -276,6 +276,8 @@ def validate_scene(scene):
                 errors.append(f"{obj.name}: dynamic body mass must be positive.")
             if min(settings.body_inertia) <= 0.0:
                 errors.append(f"{obj.name}: dynamic body inertia must be positive.")
+            if settings.body_collision_shape == "CONVEX" and settings.body_collision_margin <= 0.0:
+                errors.append(f"{obj.name}: convex collision margin must be positive.")
         if settings.role == "GRANULAR_SOURCE":
             if settings.granular_radius <= 0.0:
                 errors.append(f"{obj.name}: granular radius must be positive.")
@@ -379,6 +381,12 @@ def author_grasph_metadata(usd_path, objects):
                 prim.CreateAttribute(
                     "grasph:collisionRadius", Sdf.ValueTypeNames.Double
                 ).Set(settings.body_collision_radius)
+                prim.CreateAttribute(
+                    "grasph:collisionShape", Sdf.ValueTypeNames.String
+                ).Set(settings.body_collision_shape.lower())
+                prim.CreateAttribute(
+                    "grasph:collisionMargin", Sdf.ValueTypeNames.Double
+                ).Set(settings.body_collision_margin)
         elif settings.role == "GRANULAR_SOURCE":
             for prim in targets:
                 prim.CreateAttribute(
@@ -502,8 +510,18 @@ class GraSPHObjectSettings(PropertyGroup):
         name="Angular Damping", default=0.05, min=0.0,
     )
     body_collision_radius: FloatProperty(
-        name="Collision Radius", description="MVP spherical collision envelope",
+        name="Collision Radius", description="Spherical collision envelope",
         default=0.1, min=1.0e-6, subtype="DISTANCE",
+    )
+    body_collision_shape: EnumProperty(
+        name="Collision Shape",
+        items=(("CONVEX", "Convex Mesh", "Use the authored convex mesh"),
+               ("SPHERE", "Sphere", "Use the fast spherical envelope")),
+        default="CONVEX",
+    )
+    body_collision_margin: FloatProperty(
+        name="Collision Margin", description="Convex contact skin in metres",
+        default=0.002, min=1.0e-6, subtype="DISTANCE",
     )
     granular_radius: FloatProperty(
         name="Particle Radius", description="Radius of each spherical grain in metres",
@@ -575,6 +593,10 @@ class GraSPHSceneSettings(PropertyGroup):
     enable_collision: BoolProperty(name="Collision", default=True)
     enable_wall_pressure: BoolProperty(name="Wall Pressure", default=True)
     enable_wall_continuity: BoolProperty(name="Wall Continuity", default=True)
+    enable_solid_coupling: BoolProperty(
+        name="Fluid / Solid Coupling", default=False,
+        description="Enable two-way SPH force and reaction coupling for Dynamic Body objects",
+    )
     neighbor_backend: EnumProperty(
         name="Neighbor Backend",
         items=(("auto", "Auto", "Use SciPy cKDTree when available"),
@@ -771,6 +793,8 @@ class GRASPH_OT_run(Operator):
             command.append("--no-wall-pressure")
         if not settings.enable_wall_continuity:
             command.append("--no-wall-continuity")
+        if settings.enable_solid_coupling:
+            command.append("--solid-coupling")
         try:
             self._log_handle = open(log_file, "w", encoding="utf-8")
             startup = None
@@ -989,7 +1013,11 @@ class GRASPH_PT_entities(Panel):
                 box.prop(settings, "axle_center", text="Center")
             box.prop(settings, "body_mass")
             box.prop(settings, "body_inertia")
-            box.prop(settings, "body_collision_radius")
+            box.prop(settings, "body_collision_shape")
+            if settings.body_collision_shape == "SPHERE":
+                box.prop(settings, "body_collision_radius")
+            else:
+                box.prop(settings, "body_collision_margin")
             box.prop(settings, "body_linear_damping")
             box.prop(settings, "body_angular_damping")
         elif settings.role == "GRANULAR_SOURCE":
@@ -1054,6 +1082,7 @@ class GRASPH_PT_simulation(Panel):
             advanced.prop(settings, "enable_collision")
             advanced.prop(settings, "enable_wall_pressure")
             advanced.prop(settings, "enable_wall_continuity")
+            advanced.prop(settings, "enable_solid_coupling")
             advanced.prop(settings, "neighbor_backend")
             advanced.prop(settings, "threads")
             advanced.prop(settings, "droplet_mode")

@@ -33,6 +33,8 @@ def main():
                    help="Maximum granular solver timestep [s]")
     p.add_argument("--granular-iterations", type=int, default=4,
                    help="Sphere contact projection iterations per step")
+    p.add_argument("--solid-coupling", action="store_true",
+                   help="Enable two-way SPH coupling for Dynamic Body colliders")
     args = p.parse_args()
 
     if args.inspect_motion:
@@ -57,6 +59,7 @@ def main():
         wall_search=args.wall_search,
         granular_dt=max(1.0e-6, args.granular_dt),
         granular_iterations=max(1, args.granular_iterations),
+        enable_solid_coupling=args.solid_coupling,
     )
     run_simulation(args.usd, sph_cfg=cfg, settings=settings)
 

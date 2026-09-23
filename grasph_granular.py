@@ -14,6 +14,13 @@ import numpy as np
 
 from grasph_collision import build_colliders, resolve_collisions
 from grasph_output import save_npz, write_usd_animation
+from grasph_rigid import (
+    advance_rotation as _advance_rotation,
+    axis_angle_matrix as _axis_angle_matrix,
+    resolve_body_contacts,
+    rotation_to_euler_xyz as _rotation_to_euler_xyz,
+    world_inertia,
+)
 from grasph_scene import generate_granular_particles
 from grasph_sph import build_neighbor_pairs
 
@@ -27,38 +34,6 @@ class GranularResult:
     velocity: np.ndarray
     time: float
     steps: int
-
-
-def _axis_angle_matrix(axis, angle):
-    axis = np.asarray(axis, dtype=np.float64)
-    x, y, z = axis / np.linalg.norm(axis)
-    c, s, q = np.cos(angle), np.sin(angle), 1.0 - np.cos(angle)
-    return np.array([
-        [c + x*x*q, x*y*q - z*s, x*z*q + y*s],
-        [y*x*q + z*s, c + y*y*q, y*z*q - x*s],
-        [z*x*q - y*s, z*y*q + x*s, c + z*z*q],
-    ], dtype=np.float64)
-
-
-def _rotation_to_euler_xyz(rotation):
-    """Return XYZ Euler radians for R = Rz @ Ry @ Rx."""
-    sy = float(np.clip(-rotation[2, 0], -1.0, 1.0))
-    y = np.arcsin(sy)
-    cy = np.cos(y)
-    if abs(cy) > 1.0e-8:
-        x = np.arctan2(rotation[2, 1], rotation[2, 2])
-        z = np.arctan2(rotation[1, 0], rotation[0, 0])
-    else:
-        x = np.arctan2(-rotation[1, 2], rotation[1, 1])
-        z = 0.0
-    return np.asarray((x, y, z), dtype=np.float64)
-
-
-def _advance_rotation(rotation, omega, dt):
-    speed = float(np.linalg.norm(omega))
-    if speed < 1.0e-12:
-        return rotation
-    return _axis_angle_matrix(omega / speed, speed * dt) @ rotation
 
 
 def _sink_keep_mask(pos, sinks):
@@ -435,66 +410,19 @@ def run_granular_simulation(usd_file, scene, settings, gravity=(0.0, 0.0, -9.81)
         for path, state in body_states.items():
             body = scene.dynamic_bodies[path]
             state["velocity"] += linear_impulses.get(path, np.zeros(3)) / body.mass
-            world_inertia = (
-                state["rotation"] @ np.diag(body.inertia) @ state["rotation"].T
-            )
+            body_world_inertia = world_inertia(body, state)
             state["omega"] += np.linalg.solve(
-                world_inertia, angular_impulses.get(path, np.zeros(3))
+                body_world_inertia, angular_impulses.get(path, np.zeros(3))
             )
 
-        # MVP free-body collision envelope: each dynamic visual mesh is
-        # represented by its authored sphere radius against all other meshes.
-        body_reaction_linear = {}
-        body_reaction_angular = {}
-        for path, state in body_states.items():
-            body = scene.dynamic_bodies[path]
-            other_colliders = [collider for collider in colliders if collider.name != path]
-            if not other_colliders:
-                continue
-            body_position = (body.center + state["translation"])[None, :]
-            body_velocity = state["velocity"][None, :]
-            body_omega = state["omega"][None, :]
-            body_inertia_scalar = np.asarray([float(np.mean(body.inertia))])
-            material = scene.collider_materials.get(path, {})
-            contacts, reactions, reaction_torques = resolve_collisions(
-                body_position, body_velocity, other_colliders,
-                particle_radius=np.asarray([body.collision_radius]),
-                restitution=np.asarray([material.get("restitution", 0.1)]),
-                friction_coefficient=np.asarray([material.get("friction", 0.45)]),
-                iterations=settings.collision_iterations,
-                collider_translations=motion_next,
-                collider_velocities=collider_velocities,
-                collider_rotations=rotations,
-                collider_centers=collider_centers,
-                collider_angular_velocities=angular_velocities,
-                particle_mass=np.asarray([body.mass]),
-                particle_angular_velocities=body_omega,
-                particle_inertia=body_inertia_scalar,
-                particle_rolling_friction=np.asarray([
-                    material.get("rolling_friction", 0.02)
-                ]),
-                return_body_impulses=True,
-            )
-            total_wall_contacts += contacts
-            state["translation"] = body_position[0] - body.center
-            state["velocity"] = body_velocity[0]
-            state["omega"] = body_omega[0]
-            for other_path, impulse in reactions.items():
-                body_reaction_linear[other_path] = (
-                    body_reaction_linear.get(other_path, np.zeros(3)) + impulse
-                )
-            for other_path, impulse in reaction_torques.items():
-                body_reaction_angular[other_path] = (
-                    body_reaction_angular.get(other_path, np.zeros(3)) + impulse
-                )
+        body_contacts, body_reaction_angular = resolve_body_contacts(
+            scene, colliders, body_states, motion_next, collider_velocities,
+            rotations, collider_centers, angular_velocities,
+            iterations=settings.collision_iterations,
+        ) if body_states and colliders else (0, {})
+        total_wall_contacts += body_contacts
 
         for path, state in body_states.items():
-            body = scene.dynamic_bodies[path]
-            state["velocity"] += body_reaction_linear.get(path, np.zeros(3)) / body.mass
-            world_inertia = state["rotation"] @ np.diag(body.inertia) @ state["rotation"].T
-            state["omega"] += np.linalg.solve(
-                world_inertia, body_reaction_angular.get(path, np.zeros(3))
-            )
             state["translation"] += state["velocity"] * dt
             state["rotation"] = _advance_rotation(
                 state["rotation"], state["omega"], dt

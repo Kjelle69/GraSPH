@@ -20,6 +20,9 @@ from grasph_boundary import (
 from grasph_reference import hydrostatic_reference_state, compute_well_balanced_base_acceleration
 from grasph_free_surface import FreeSurfaceConfig, collider_triangle_data, compute_atmospheric_state
 from grasph_output import save_npz, write_usd_animation
+from grasph_rigid import (
+    advance_rotation, resolve_body_contacts, rotation_to_euler_xyz, world_inertia,
+)
 
 
 @dataclass
@@ -45,6 +48,7 @@ class SolverSettings:
     wall_search: str = "cached"
     granular_dt: float = 0.001
     granular_iterations: int = 4
+    enable_solid_coupling: bool = False
 
 
 @dataclass
@@ -216,11 +220,6 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
         return run_granular_simulation(
             usd_file, scene, settings, gravity=sph_cfg.gravity
         )
-    if scene.dynamic_bodies:
-        raise RuntimeError(
-            "Dynamic Body is currently supported by granular simulations only; "
-            "use Dynamic Hinge for WCSPH."
-        )
 
     kernel = WendlandC2(sph_cfg.h)
     particle_radius = settings.particle_radius_factor * sph_cfg.dp
@@ -283,6 +282,18 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
         for path in scene.hinges
     }
     hinge_centers = {path: hinge.center for path, hinge in scene.hinges.items()}
+    body_states = {
+        path: {
+            "translation": np.zeros(3), "velocity": np.zeros(3),
+            "rotation": np.eye(3), "omega": np.zeros(3),
+        }
+        for path in scene.dynamic_bodies
+    } if settings.enable_solid_coupling else {}
+    body_paths = list(body_states)
+    collider_centers = dict(hinge_centers)
+    collider_centers.update({
+        path: body.center for path, body in scene.dynamic_bodies.items()
+    })
 
     # Reference pose is the USD stage start time. Any animated collider is
     # sampled in source-scene seconds from there. v0.54 supports pure
@@ -302,6 +313,8 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
     frame_ids = []
     frame_hinge_angles, frame_hinge_omegas = [], []
     hinge_paths = list(scene.hinges)
+    frame_body_translations = {path: [] for path in body_paths}
+    frame_body_rotations = {path: [] for path in body_paths}
 
     def snapshot(t, state=None, detached=None):
         rr, pp, _ = hydrostatic_reference_state(pos, surface_level, sph_cfg, return_depth=True)
@@ -336,6 +349,11 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
         frame_hinge_omegas.append(
             np.asarray([hinge_states[path]["omega"] for path in hinge_paths], dtype=np.float64)
         )
+        for path in body_paths:
+            frame_body_translations[path].append(body_states[path]["translation"].copy())
+            frame_body_rotations[path].append(
+                rotation_to_euler_xyz(body_states[path]["rotation"])
+            )
 
     pair_i0, pair_j0 = build_neighbor_pairs(pos, sph_cfg.support)
     counts0 = neighbor_counts(n, pair_i0, pair_j0)
@@ -375,6 +393,7 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
 
     print("\n========================================")
     print("STARTING GENERIC WCSPH")
+    print(f"Fluid/solid coupling: {'ON' if body_states else 'OFF'}")
     print("========================================\n")
 
     while t < settings.sim_time - 1e-15:
@@ -386,6 +405,12 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
             if t < event_time < t + dt:
                 dt = event_time - t
                 break
+
+        for path, state in body_states.items():
+            body = scene.dynamic_bodies[path]
+            state["velocity"] += np.asarray(sph_cfg.gravity) * dt
+            state["velocity"] /= 1.0 + body.linear_damping * dt
+            state["omega"] /= 1.0 + body.angular_damping * dt
 
         # Sample Blender/OpenUSD collider transforms at the current and next
         # solver times. Distance fields remain in their reference pose and are
@@ -408,6 +433,11 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
             motion_next = {}
             collider_velocities = {}
 
+        for path, state in body_states.items():
+            motion_now[path] = state["translation"].copy()
+            motion_next[path] = state["translation"].copy()
+            collider_velocities[path] = state["velocity"].copy()
+
         collider_rotations = {
             path: _axis_angle_matrix(scene.hinges[path].axis, state["angle"])
             for path, state in hinge_states.items()
@@ -416,17 +446,23 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
             path: scene.hinges[path].axis * state["omega"]
             for path, state in hinge_states.items()
         }
+        collider_rotations.update({
+            path: state["rotation"] for path, state in body_states.items()
+        })
+        collider_angular_velocities.update({
+            path: state["omega"] for path, state in body_states.items()
+        })
         _apply_boundary_motion(
             boundary, base_boundary_positions, base_boundary_normals,
-            base_facing_positions, motion_now, collider_rotations, hinge_centers,
+            base_facing_positions, motion_now, collider_rotations, collider_centers,
         )
         wall_velocity = _boundary_velocity_array(
             boundary, collider_velocities, collider_angular_velocities,
-            hinge_centers, motion_now,
+            collider_centers, motion_now,
         )
         solid_triangles, solid_normals = _rigid_solid_geometry(
             solid_triangles_base, solid_normals_base, solid_triangle_paths,
-            motion_now, collider_rotations, hinge_centers,
+            motion_now, collider_rotations, collider_centers,
         )
 
         _tp = time.perf_counter()
@@ -463,7 +499,7 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
 
         need_wall = settings.enable_wall_pressure or settings.enable_wall_continuity or fs_cfg.mode != "none"
         _tp = time.perf_counter()
-        active_wall_search = None if hinge_states else wall_search
+        active_wall_search = None if (hinge_states or body_states) else wall_search
         wall_interactions = build_wall_interactions(
             pos, boundary, kernel, sph_cfg.support, active_wall_search, motion_now
         ) if (need_wall and len(boundary.positions)) else _empty_wall_interactions()
@@ -489,23 +525,33 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
             )
 
         pressure_torques = {path: 0.0 for path in hinge_states}
-        if len(wall_pair_j) and hinge_states:
+        pressure_body_forces = {path: np.zeros(3) for path in body_states}
+        pressure_body_torques = {path: np.zeros(3) for path in body_states}
+        if len(wall_pair_j) and (hinge_states or body_states):
             reaction_forces = -sph_cfg.mass * wall_pair_acceleration
             for source_id, path in enumerate(boundary.source_paths):
-                if path not in hinge_states:
+                if path not in hinge_states and path not in body_states:
                     continue
                 pair_mask = boundary.source_ids[wall_pair_j] == source_id
                 if not np.any(pair_mask):
                     continue
                 boundary_ids = wall_pair_j[pair_mask]
-                center = scene.hinges[path].center + np.asarray(
+                reference_center = (
+                    scene.hinges[path].center if path in hinge_states
+                    else scene.dynamic_bodies[path].center
+                )
+                center = reference_center + np.asarray(
                     motion_now.get(path, (0.0, 0.0, 0.0)), dtype=np.float64
                 )
                 lever = boundary.positions[boundary_ids] - center[None, :]
                 torque_vectors = np.cross(lever, reaction_forces[pair_mask])
-                pressure_torques[path] = float(
-                    np.sum(torque_vectors @ scene.hinges[path].axis)
-                )
+                if path in hinge_states:
+                    pressure_torques[path] = float(
+                        np.sum(torque_vectors @ scene.hinges[path].axis)
+                    )
+                else:
+                    pressure_body_forces[path] += np.sum(reaction_forces[pair_mask], axis=0)
+                    pressure_body_torques[path] += np.sum(torque_vectors, axis=0)
 
         acc_base = compute_well_balanced_base_acceleration(rho, rho_ref, depth_ref, sph_cfg.gravity)
         acc_visc = compute_artificial_viscosity_acceleration(
@@ -530,7 +576,7 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
 
         _tp = time.perf_counter()
         if settings.enable_collision and colliders:
-            contacts, angular_impulses = resolve_collisions(
+            collision_result = resolve_collisions(
                 pos, vel, colliders,
                 particle_radius=particle_radius,
                 restitution=0.0,
@@ -539,14 +585,21 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
                 collider_translations=motion_next,
                 collider_velocities=collider_velocities,
                 collider_rotations=collider_rotations,
-                collider_centers=hinge_centers,
+                collider_centers=collider_centers,
                 collider_angular_velocities=collider_angular_velocities,
                 particle_mass=sph_cfg.mass,
                 return_angular_impulses=True,
+                return_body_impulses=bool(body_states),
             )
+            if body_states:
+                contacts, linear_impulses, angular_impulses = collision_result
+            else:
+                contacts, angular_impulses = collision_result
+                linear_impulses = {}
         else:
             contacts = 0
             angular_impulses = {}
+            linear_impulses = {}
         total_contacts += contacts
         perf["collision"] += time.perf_counter() - _tp
 
@@ -566,6 +619,34 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
                 ))
             state["angle"] += state["omega"] * dt
             state["torque"] = torque
+
+        for path, state in body_states.items():
+            body = scene.dynamic_bodies[path]
+            body_inertia = world_inertia(body, state)
+            state["velocity"] += (
+                pressure_body_forces[path] * dt
+                + linear_impulses.get(path, np.zeros(3))
+            ) / body.mass
+            state["omega"] += np.linalg.solve(
+                body_inertia,
+                pressure_body_torques[path] * dt
+                + angular_impulses.get(path, np.zeros(3)),
+            )
+
+        body_contacts, body_hinge_reactions = resolve_body_contacts(
+            scene, colliders, body_states, motion_next, collider_velocities,
+            collider_rotations, collider_centers, collider_angular_velocities,
+            iterations=settings.collision_iterations,
+        ) if body_states and colliders else (0, {})
+        total_contacts += body_contacts
+        for path, impulse in body_hinge_reactions.items():
+            if path not in hinge_states:
+                continue
+            hinge = scene.hinges[path]
+            hinge_states[path]["omega"] += float(np.dot(impulse, hinge.axis)) / hinge.moment_of_inertia
+        for state in body_states.values():
+            state["translation"] += state["velocity"] * dt
+            state["rotation"] = advance_rotation(state["rotation"], state["omega"], dt)
 
         if scene.sinks:
             keep = _sink_keep_mask(pos, scene.sinks)
@@ -655,6 +736,13 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
         hinge_paths=np.asarray(hinge_paths),
         hinge_angles=np.asarray(frame_hinge_angles, dtype=np.float64),
         hinge_angular_velocities=np.asarray(frame_hinge_omegas, dtype=np.float64),
+        body_paths=np.asarray(body_paths),
+        body_translations=np.asarray([
+            frame_body_translations[path] for path in body_paths
+        ], dtype=np.float64),
+        body_rotations=np.asarray([
+            frame_body_rotations[path] for path in body_paths
+        ], dtype=np.float64),
     )
     print("\nWriting outputs...")
     save_npz(npz_output, **arrays)
@@ -669,6 +757,14 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
                 "angles": np.asarray(frame_hinge_angles)[:, i],
             }
             for i, path in enumerate(hinge_paths)
+        },
+        body_frames={
+            path: {
+                "driver_path": scene.dynamic_bodies[path].driver_path,
+                "translations": np.asarray(frame_body_translations[path]),
+                "rotations": np.asarray(frame_body_rotations[path]),
+            }
+            for path in body_paths
         },
     )
 

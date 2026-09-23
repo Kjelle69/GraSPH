@@ -49,7 +49,10 @@ class DynamicBodyData:
     inertia: np.ndarray
     linear_damping: float
     angular_damping: float
+    collision_shape: str
     collision_radius: float
+    collision_margin: float
+    collision_samples: np.ndarray
 
 
 @dataclass
@@ -265,7 +268,7 @@ def _hinge_for_prim(prim):
     )
 
 
-def _dynamic_body_for_prim(prim):
+def _dynamic_body_for_prim(prim, mesh_data):
     enabled, owner = _inherited_attribute(prim, "grasph:dynamicBodyEnabled")
     if not bool(enabled):
         return None
@@ -275,6 +278,8 @@ def _dynamic_body_for_prim(prim):
     linear_damping, _ = _inherited_attribute(prim, "grasph:linearDamping")
     angular_damping, _ = _inherited_attribute(prim, "grasph:bodyAngularDamping")
     collision_radius, _ = _inherited_attribute(prim, "grasph:collisionRadius")
+    collision_shape, _ = _inherited_attribute(prim, "grasph:collisionShape")
+    collision_margin, _ = _inherited_attribute(prim, "grasph:collisionMargin")
     mass = float(1.0 if mass is None else mass)
     inertia = np.asarray((0.1, 0.1, 0.1) if inertia is None else inertia, dtype=np.float64)
     if mass <= 0.0 or np.any(inertia <= 0.0):
@@ -292,13 +297,34 @@ def _dynamic_body_for_prim(prim):
     if not driver or not driver.IsValid():
         driver = owner
 
+    # Convex contact samples cover vertices, edge midpoints and face centroids.
+    # The solver requires a convex authored mesh; concave decomposition remains
+    # a separate compound-body feature.
+    vertices = np.asarray(mesh_data.vertices, dtype=np.float64)
+    triangles = np.asarray(mesh_data.triangles, dtype=np.float64)
+    samples = [vertices]
+    if len(triangles):
+        samples.append(np.mean(triangles, axis=1))
+        samples.append(np.vstack((
+            0.5 * (triangles[:, 0] + triangles[:, 1]),
+            0.5 * (triangles[:, 1] + triangles[:, 2]),
+            0.5 * (triangles[:, 2] + triangles[:, 0]),
+        )))
+    samples = np.vstack(samples)
+    scale = 1.0e-9
+    _, unique = np.unique(np.round(samples / scale).astype(np.int64), axis=0, return_index=True)
+    samples = samples[np.sort(unique)]
+
     return DynamicBodyData(
         path=str(prim.GetPath()), driver_path=str(driver.GetPath()),
         center=np.asarray(center if center is not None else (0.0, 0.0, 0.0), dtype=np.float64),
         mass=mass, inertia=inertia,
         linear_damping=max(0.0, float(0.05 if linear_damping is None else linear_damping)),
         angular_damping=max(0.0, float(0.05 if angular_damping is None else angular_damping)),
+        collision_shape=str(collision_shape or "convex").strip().lower(),
         collision_radius=max(1.0e-6, float(0.1 if collision_radius is None else collision_radius)),
+        collision_margin=max(1.0e-6, float(0.002 if collision_margin is None else collision_margin)),
+        collision_samples=samples,
     )
 
 
@@ -491,7 +517,7 @@ def load_scene(usd_file):
             hinge = _hinge_for_prim(prim)
             if hinge is not None:
                 hinges[data.path] = hinge
-            body = _dynamic_body_for_prim(prim)
+            body = _dynamic_body_for_prim(prim, data)
             if body is not None:
                 dynamic_bodies[data.path] = body
 

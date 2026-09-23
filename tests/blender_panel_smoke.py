@@ -22,7 +22,7 @@ bpy.context.scene.grasph_scene.project_root = ""
 assert Path(addon._surface_module(bpy.context.scene).__file__).resolve() == (
     root / "blender" / "grasph_surface.py"
 ).resolve()
-assert addon.ADDON_VERSION == (0, 5, 1)
+assert addon.ADDON_VERSION == (0, 6, 0)
 
 bpy.ops.object.select_all(action="SELECT")
 bpy.ops.object.delete(use_global=False)
@@ -110,6 +110,8 @@ dynamic = cube("Dynamic Body Test", "DYNAMIC_BODY", (0.5, 0.0, 0.5))
 dynamic.grasph.body_mass = 2.5
 dynamic.grasph.body_inertia = (0.2, 0.3, 0.4)
 dynamic.grasph.body_collision_radius = 0.15
+dynamic.grasph.body_collision_shape = "CONVEX"
+dynamic.grasph.body_collision_margin = 0.004
 errors, warnings = addon.validate_scene(bpy.context.scene)
 assert not errors, errors
 granular_output = root / "output" / "blender_granular_smoke.usdc"
@@ -130,6 +132,8 @@ dynamic_prim = next(
 )
 assert abs(dynamic_prim.GetAttribute("grasph:mass").Get() - 2.5) < 1e-6
 assert abs(dynamic_prim.GetAttribute("grasph:collisionRadius").Get() - 0.15) < 1e-6
+assert dynamic_prim.GetAttribute("grasph:collisionShape").Get() == "convex"
+assert abs(dynamic_prim.GetAttribute("grasph:collisionMargin").Get() - 0.004) < 1e-6
 
 # The result display instances renderable spheres on an animated point cloud.
 cloud_data = bpy.data.pointclouds.new("Granular Result Points")

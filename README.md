@@ -1,4 +1,16 @@
-# GraSPH granular sources (Blender controls v0.5.1)
+# GraSPH rigid mesh coupling (Blender controls v0.6.0)
+
+Dynamic Body now supports a sampled convex mesh collider instead of requiring
+a spherical envelope. In Blender choose `Dynamic Body` and `Convex Mesh`; the
+authored mesh must be convex. Static and kinematic collision meshes may still
+be arbitrary triangle meshes. `Collision Margin` controls the thin contact
+skin.
+
+For SPH scenes, enable `Advanced Settings > Fluid / Solid Coupling` to apply
+fluid pressure and collision reactions to Dynamic Body objects and write their
+translation/rotation animation to the result USD. With the option disabled the
+bodies remain fixed fluid colliders. Granular and fluid source particles are
+still separate simulation modes.
 
 Blender can now author initial `Granular Volume` sources and timed `Granular
 Flow Source` outlets with particle radius, material density, friction,

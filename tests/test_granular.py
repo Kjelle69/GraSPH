@@ -32,6 +32,47 @@ def _cube(stage, path, lo, hi, role):
 
 
 class GranularTests(unittest.TestCase):
+    def test_fluid_dynamic_body_coupling_is_optional(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source_file = Path(directory) / "fluid_body.usda"
+            stage = Usd.Stage.CreateNew(str(source_file))
+            UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+            UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+            _cube(
+                stage, "/Fluid", (-0.05, -0.05, 0.0),
+                (0.05, 0.05, 0.10), "fluid",
+            )
+            driver = UsdGeom.Xform.Define(stage, "/Body")
+            driver.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.0))
+            driver.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+            body = _cube(
+                stage, "/Body/Geom", (0.95, -0.05, 0.25),
+                (1.05, 0.05, 0.35), "collider",
+            )
+            for name, value_type, value in (
+                ("grasph:dynamicBodyEnabled", Sdf.ValueTypeNames.Bool, True),
+                ("grasph:bodyCenter", Sdf.ValueTypeNames.Double3, Gf.Vec3d(1.0, 0.0, 0.3)),
+                ("grasph:mass", Sdf.ValueTypeNames.Double, 1.0),
+                ("grasph:inertiaDiagonal", Sdf.ValueTypeNames.Double3, Gf.Vec3d(0.01, 0.01, 0.01)),
+                ("grasph:collisionShape", Sdf.ValueTypeNames.String, "convex"),
+            ):
+                body.CreateAttribute(name, value_type).Set(value)
+            stage.GetRootLayer().Save()
+
+            result = run_simulation(
+                source_file, sph_cfg=SPHConfig(dp=0.05),
+                settings=SolverSettings(
+                    sim_time=0.02, output_fps=100.0, output_dir=directory,
+                    output_stem="coupled", enable_solid_coupling=True,
+                    report_interval=100.0,
+                ),
+            )
+            output = Usd.Stage.Open(result.usd_file)
+            translate = output.GetPrimAtPath("/Body").GetAttribute("xformOp:translate")
+            samples = translate.GetTimeSamples()
+            self.assertGreaterEqual(len(samples), 2)
+            self.assertLess(float(translate.Get(samples[-1])[2]), 0.0)
+
     def test_dynamic_body_falls_and_authors_transform(self):
         with tempfile.TemporaryDirectory() as directory:
             source_file = Path(directory) / "dynamic_body.usda"
