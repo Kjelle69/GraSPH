@@ -1,3 +1,51 @@
+# GraSPH granular sources (Blender controls v0.5.1)
+
+Blender can now author initial `Granular Volume` sources and timed `Granular
+Flow Source` outlets with particle radius, material density, friction,
+restitution, flow rate and initial velocity. The external solver automatically
+runs a spherical DEM/PBD path with gravity, grain contacts, mesh collision,
+sinks and collision-driven hinges. Results are written as
+`/GraSPH_GranularResult` USD Points and imported with a Geometry Nodes sphere display. See
+[`blender/README.md`](blender/README.md) for the current scope and workflow.
+
+Granular spheres now carry angular velocity and solid-sphere inertia. Coulomb
+contact impulses therefore transfer sliding motion into spin, while separate
+rolling resistance controls how quickly rolling decays. Static, kinematic,
+hinged and free dynamic colliders expose friction, restitution and rolling
+resistance as authored `grasph:*` surface properties.
+
+`Dynamic Body` is the first free 6-DOF rigid-body path: mass, inertia, damping
+and simulated translation/rotation are written back to USD. Its environment
+collision envelope is currently an authored sphere radius; mesh/convex contact
+is a planned refinement.
+
+---
+
+# GraSPH fluid surface preview in Blender
+
+The first Geometry Nodes meshing workflow is available in
+[`blender/README.md`](blender/README.md). It retains the animated USD particle
+cache and adds independent surface/particle display controls. SPH physics is
+unchanged.
+
+---
+
+# Dynamic paddle-wheel axle
+
+`examples/PaddleWheel/PaddleWheel.usdc` now marks the wheel as a free X-axis
+hinge. The runtime keeps its axle center fixed and integrates angular motion
+from SPH wall-pressure reaction torque and geometric collision impulses. Wall
+particles, normals, distance-field queries and finite-face geometry follow the
+rotation. The result USD animates the wheel transform, while the NPZ records
+`hinge_angles` and `hinge_angular_velocities`.
+
+The hinge parameters are authored as `grasph:hingeEnabled`,
+`grasph:axleCenter`, `grasph:momentOfInertia`, `grasph:angularDamping` and
+`grasph:maxAngularSpeed`. Authored collider animation remains translation-only;
+the solver-generated hinge rotation is the supported rotational path.
+
+---
+
 # GraSPH v0.54 FIX7 — cached collider neighbour trees
 
 FIX7 is a CPU-only change. Each collider's SPH wall particles keep a SciPy
@@ -7,7 +55,6 @@ velocities continue to follow the source USD animation. Candidate searches have
 a conservative floating-point border, with ambiguous support-distance pairs
 checked in world coordinates. The strict support boundary is preserved.
 
-The physics and translation-only kinematic scope of FIX6 are unchanged.
 Trees belong to a single simulation and are not shared between scenes.
 Without SciPy, the original grid search remains available.
 
@@ -162,6 +209,7 @@ t=0.27 s.
 
 Supported now:
 - object/parent translation animation from USD
+- solver-driven single-axis hinge rotation from fluid forces
 - static and translated distance-field collision without DF rebuild
 - collision response in the moving-wall frame
 - SPH wall particles translated with the collider
@@ -170,10 +218,10 @@ Supported now:
 - source USD timing preserved in the result USDC
 
 Not supported yet:
-- animated rotation
+- authored collider rotation animation
 - animated scale
 - deforming collider mesh points
-- dynamic rigid-body response from fluid forces
+- unconstrained six-degree-of-freedom rigid bodies
 
 If an animated collider rotates or scales, v0.54 stops with a clear error
 instead of silently using incorrect collision geometry.

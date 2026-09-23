@@ -1,10 +1,14 @@
 from pathlib import Path
 import os
 import numpy as np
-from pxr import Usd, UsdGeom, Gf
+from pxr import Usd, UsdGeom, Gf, Sdf
 
 
-def write_usd_animation(stage, frames, frame_times, fps, dp, output_file, source_start_time_code=None, source_tps=None):
+def write_usd_animation(stage, frames, frame_times, fps, dp, output_file,
+                        source_start_time_code=None, source_tps=None,
+                        hinge_frames=None, frame_velocities=None,
+                        prim_path="/GraSPH_Result", particle_widths=None,
+                        result_kind="fluid", body_frames=None):
     """Write GraSPH Points as a USD overlay on the original source scene.
 
     v0.54 FIX2 deliberately does *not* flatten/copy the source scene. Instead
@@ -54,15 +58,89 @@ def write_usd_animation(stage, frames, frame_times, fps, dp, output_file, source
 
     # Keep simulation points separate from source prim hierarchy. This avoids
     # authoring stronger specs on /root or Blender-created parent prims.
-    points_prim = UsdGeom.Points.Define(result_stage, "/GraSPH_Result")
+    points_prim = UsdGeom.Points.Define(result_stage, prim_path)
+    points_prim.GetPrim().CreateAttribute(
+        "grasph:resultKind", Sdf.ValueTypeNames.String
+    ).Set(str(result_kind))
     points_attr = points_prim.CreatePointsAttr()
     widths_attr = points_prim.CreateWidthsAttr()
-    widths_attr.Set([float(dp)] * len(frames[0]))
+    velocities_attr = points_prim.CreateVelocitiesAttr() if frame_velocities is not None else None
 
     usd_times = [source_start + float(t) * source_rate for t in frame_times]
-    for tc, positions in zip(usd_times, frames):
+    for frame_index, (tc, positions) in enumerate(zip(usd_times, frames)):
         usd_points = [Gf.Vec3f(float(p[0]), float(p[1]), float(p[2])) for p in positions]
         points_attr.Set(usd_points, tc)
+        if particle_widths is None:
+            widths = [float(dp)] * len(positions)
+        else:
+            width_values = np.asarray(particle_widths, dtype=np.float64)
+            if width_values.ndim == 0:
+                widths = [float(width_values)] * len(positions)
+            else:
+                widths = [float(v) for v in width_values[:len(positions)]]
+        widths_attr.Set(widths, tc)
+        if velocities_attr is not None:
+            velocities = frame_velocities[frame_index]
+            usd_velocities = [
+                Gf.Vec3f(float(v[0]), float(v[1]), float(v[2])) for v in velocities
+            ]
+            velocities_attr.Set(usd_velocities, tc)
+
+    # Overlay the simulated axle rotation on the Blender-authored rotateXYZ
+    # operation. The source layer still owns translation, scale, materials and
+    # geometry; this stronger layer only supplies time-varying wheel angles.
+    for data in (hinge_frames or {}).values():
+        driver_path = data["driver_path"]
+        source_driver = stage.GetPrimAtPath(driver_path)
+        source_rotate = source_driver.GetAttribute("xformOp:rotateXYZ")
+        base = source_rotate.Get(source_start) if source_rotate else None
+        base = np.asarray(base if base is not None else (0.0, 0.0, 0.0), dtype=np.float64)
+        axis = np.asarray(data["axis"], dtype=np.float64)
+        component = int(np.argmax(np.abs(axis)))
+        sign = float(np.sign(axis[component]))
+        driver = result_stage.OverridePrim(driver_path)
+        rotate_attr = driver.CreateAttribute("xformOp:rotateXYZ", Sdf.ValueTypeNames.Float3)
+        for tc, angle in zip(usd_times, data["angles"]):
+            value = base.copy()
+            value[component] += sign * np.degrees(float(angle))
+            rotate_attr.Set(Gf.Vec3f(*map(float, value)), tc)
+
+    # Free rigid bodies use the Blender-exported translate/rotateXYZ ops. The
+    # result layer supplies only simulated deltas; mesh, scale and materials
+    # continue to come from the source sublayer.
+    for data in (body_frames or {}).values():
+        driver_path = data["driver_path"]
+        source_driver = stage.GetPrimAtPath(driver_path)
+        source_translate = source_driver.GetAttribute("xformOp:translate")
+        source_rotate = source_driver.GetAttribute("xformOp:rotateXYZ")
+        base_translate = source_translate.Get(source_start) if source_translate else None
+        base_rotate = source_rotate.Get(source_start) if source_rotate else None
+        base_translate = np.asarray(
+            base_translate if base_translate is not None else (0.0, 0.0, 0.0),
+            dtype=np.float64,
+        )
+        base_rotate = np.asarray(
+            base_rotate if base_rotate is not None else (0.0, 0.0, 0.0),
+            dtype=np.float64,
+        )
+        driver = result_stage.OverridePrim(driver_path)
+        translate_type = (
+            source_translate.GetTypeName() if source_translate
+            else Sdf.ValueTypeNames.Double3
+        )
+        rotate_type = (
+            source_rotate.GetTypeName() if source_rotate
+            else Sdf.ValueTypeNames.Float3
+        )
+        translate_attr = driver.CreateAttribute("xformOp:translate", translate_type)
+        rotate_attr = driver.CreateAttribute("xformOp:rotateXYZ", rotate_type)
+        for tc, translation, rotation in zip(
+            usd_times, data["translations"], data["rotations"]
+        ):
+            translated = base_translate + np.asarray(translation, dtype=np.float64)
+            rotated = base_rotate + np.degrees(np.asarray(rotation, dtype=np.float64))
+            translate_attr.Set(Gf.Vec3d(*map(float, translated)), tc)
+            rotate_attr.Set(Gf.Vec3f(*map(float, rotated)), tc)
 
     result_stage.SetStartTimeCode(min(source_start, usd_times[0] if usd_times else source_start))
     result_stage.SetEndTimeCode(max(source_end, usd_times[-1] if usd_times else source_end))

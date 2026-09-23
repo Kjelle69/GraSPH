@@ -15,10 +15,50 @@ class MeshData:
 
 
 @dataclass
+class HingeData:
+    path: str
+    driver_path: str
+    axis: np.ndarray
+    center: np.ndarray
+    moment_of_inertia: float
+    angular_damping: float
+    max_angular_speed: float
+
+
+@dataclass
+class GranularSourceData:
+    mesh: MeshData
+    source_mode: str
+    particle_radius: float
+    density: float
+    friction: float
+    restitution: float
+    rolling_friction: float
+    flow_rate: float
+    initial_velocity: np.ndarray
+    start_time: float
+    end_time: float
+
+
+@dataclass
+class DynamicBodyData:
+    path: str
+    driver_path: str
+    center: np.ndarray
+    mass: float
+    inertia: np.ndarray
+    linear_damping: float
+    angular_damping: float
+    collision_radius: float
+
+
+@dataclass
 class SceneData:
     stage: object
     fluid_sources: list
+    granular_sources: list
     colliders: list
+    sinks: list
     source_file: str
     start_time_code: float
     end_time_code: float
@@ -29,6 +69,9 @@ class SceneData:
     motion_time_codes: dict
     motion_translations: dict
     motion_driver_paths: dict
+    hinges: dict
+    collider_materials: dict
+    dynamic_bodies: dict
 
     def sim_seconds_to_time_code(self, t_seconds):
         return float(self.start_time_code + float(t_seconds) * self.time_codes_per_second)
@@ -76,7 +119,14 @@ class SceneData:
         animated = self.animated_collider_paths()
         if not animated:
             print("Animated colliders: NONE")
-            print("Physics will treat every collider as static.")
+            if self.hinges or self.dynamic_bodies:
+                print(
+                    f"Authored kinematic motion: none; {len(self.hinges)} dynamic "
+                    f"hinge(s) and {len(self.dynamic_bodies)} dynamic body/bodies "
+                    "will be integrated by the solver."
+                )
+            else:
+                print("Physics will treat every collider as static.")
             return
         span = max(0.0, (self.end_time_code-self.start_time_code)/self.time_codes_per_second)
         probes = [0.0, .25*span, .5*span, .75*span, span]
@@ -132,9 +182,124 @@ def _role_for_prim(prim):
             return str(value).strip().lower()
 
     parts = [p.lower() for p in str(prim.GetPath()).split("/") if p]
+    if any(p.startswith("sinkvolume") for p in parts):
+        return "sink"
     if any(p == "fluidvolume" or p.startswith("fluidvolume") for p in parts):
         return "fluid"
     return "collider"
+
+
+def _inherited_attribute(prim, name):
+    """Return the nearest authored custom attribute and the prim owning it."""
+    current = prim
+    while current and current.IsValid():
+        attr = current.GetAttribute(name)
+        if attr and attr.HasAuthoredValueOpinion():
+            value = attr.Get()
+            if value is not None:
+                return value, current
+        current = current.GetParent()
+    return None, None
+
+
+def _float_attribute(prim, name, default):
+    value, _ = _inherited_attribute(prim, name)
+    return float(default if value is None else value)
+
+
+def _string_attribute(prim, name, default):
+    value, _ = _inherited_attribute(prim, name)
+    return str(default if value is None else value).strip().lower()
+
+
+def _vec3_attribute(prim, name, default):
+    value, _ = _inherited_attribute(prim, name)
+    return np.asarray(default if value is None else value, dtype=np.float64)
+
+
+def _hinge_for_prim(prim):
+    enabled, owner = _inherited_attribute(prim, "grasph:hingeEnabled")
+    if not bool(enabled):
+        return None
+
+    axis_value, _ = _inherited_attribute(prim, "grasph:axis")
+    axis_name = str(axis_value or "X").strip().upper()
+    axes = {
+        "X": np.array([1.0, 0.0, 0.0], dtype=np.float64),
+        "Y": np.array([0.0, 1.0, 0.0], dtype=np.float64),
+        "Z": np.array([0.0, 0.0, 1.0], dtype=np.float64),
+    }
+    if axis_name not in axes:
+        raise RuntimeError(f"Unsupported hinge axis {axis_name!r} on {prim.GetPath()}")
+
+    center_value, _ = _inherited_attribute(prim, "grasph:axleCenter")
+    if center_value is None:
+        center_value, _ = _inherited_attribute(prim, "grasph:axle_center")
+    if center_value is None:
+        raise RuntimeError(f"Hinged collider {prim.GetPath()} has no grasph:axleCenter")
+
+    inertia, _ = _inherited_attribute(prim, "grasph:momentOfInertia")
+    damping, _ = _inherited_attribute(prim, "grasph:angularDamping")
+    max_speed, _ = _inherited_attribute(prim, "grasph:maxAngularSpeed")
+    inertia = float(inertia if inertia is not None else 0.002)
+    if not np.isfinite(inertia) or inertia <= 0.0:
+        raise RuntimeError(f"Hinged collider {prim.GetPath()} needs positive moment of inertia")
+
+    driver = prim
+    while driver and driver.IsValid():
+        rotate = driver.GetAttribute("xformOp:rotateXYZ")
+        if rotate and rotate.HasAuthoredValueOpinion():
+            break
+        driver = driver.GetParent()
+    if not driver or not driver.IsValid():
+        driver = owner
+
+    return HingeData(
+        path=str(prim.GetPath()),
+        driver_path=str(driver.GetPath()),
+        axis=axes[axis_name],
+        center=np.asarray(center_value, dtype=np.float64),
+        moment_of_inertia=inertia,
+        angular_damping=max(0.0, float(damping if damping is not None else 0.002)),
+        max_angular_speed=max(0.0, float(max_speed if max_speed is not None else 40.0)),
+    )
+
+
+def _dynamic_body_for_prim(prim):
+    enabled, owner = _inherited_attribute(prim, "grasph:dynamicBodyEnabled")
+    if not bool(enabled):
+        return None
+    center, _ = _inherited_attribute(prim, "grasph:bodyCenter")
+    mass, _ = _inherited_attribute(prim, "grasph:mass")
+    inertia, _ = _inherited_attribute(prim, "grasph:inertiaDiagonal")
+    linear_damping, _ = _inherited_attribute(prim, "grasph:linearDamping")
+    angular_damping, _ = _inherited_attribute(prim, "grasph:bodyAngularDamping")
+    collision_radius, _ = _inherited_attribute(prim, "grasph:collisionRadius")
+    mass = float(1.0 if mass is None else mass)
+    inertia = np.asarray((0.1, 0.1, 0.1) if inertia is None else inertia, dtype=np.float64)
+    if mass <= 0.0 or np.any(inertia <= 0.0):
+        raise RuntimeError(f"Dynamic body {prim.GetPath()} needs positive mass and inertia")
+    # Blender authors object transforms on the parent Xform and mesh geometry
+    # on a child prim. Metadata is copied to both, so the attribute owner is not
+    # necessarily the transform driver. Walk upward to the first prim carrying
+    # an authored xform op, just as the hinge path does.
+    driver = prim
+    while driver and driver.IsValid():
+        xformable = UsdGeom.Xformable(driver)
+        if xformable and xformable.GetOrderedXformOps():
+            break
+        driver = driver.GetParent()
+    if not driver or not driver.IsValid():
+        driver = owner
+
+    return DynamicBodyData(
+        path=str(prim.GetPath()), driver_path=str(driver.GetPath()),
+        center=np.asarray(center if center is not None else (0.0, 0.0, 0.0), dtype=np.float64),
+        mass=mass, inertia=inertia,
+        linear_damping=max(0.0, float(0.05 if linear_damping is None else linear_damping)),
+        angular_damping=max(0.0, float(0.05 if angular_damping is None else angular_damping)),
+        collision_radius=max(1.0e-6, float(0.1 if collision_radius is None else collision_radius)),
+    )
 
 
 def _matrix_parts(xf):
@@ -174,7 +339,10 @@ def _motion_driver_path(mesh_prim):
         p = p.GetParent()
     return str(mesh_prim.GetPath())
 
-def _sample_motion_tables(stage, colliders, ref_linear, ref_translation, start_tc, end_tc, tps, fps, linear_tol=1e-6):
+def _sample_motion_tables(stage, colliders, ref_linear, ref_translation,
+                          start_tc, end_tc, tps, fps, hinges=None,
+                          dynamic_bodies=None,
+                          linear_tol=1e-6):
     # Sample at source-frame cadence. Blender's USD exporter normally bakes
     # object animation at this cadence, including parent-Xform animation.
     frame_step = float(tps/fps) if fps > 0 else 1.0
@@ -193,9 +361,20 @@ def _sample_motion_tables(stage, colliders, ref_linear, ref_translation, start_t
     motion_times = {}
     motion_vals = {}
     driver_paths = {}
+    hinges = hinges or {}
+    dynamic_bodies = dynamic_bodies or {}
     for mesh in colliders:
         prim = stage.GetPrimAtPath(mesh.path)
         driver_paths[mesh.path] = _motion_driver_path(prim)
+        if mesh.path in hinges or mesh.path in dynamic_bodies:
+            # A dynamic hinge owns its rotation from simulation time zero.
+            # Imported result USDs may contain old wheel animation; treating
+            # that as kinematic motion would both reject the scene and apply
+            # two competing rotations. Keep the authored start pose as the
+            # reference geometry and discard every authored motion delta.
+            motion_times[mesh.path] = sample_tcs.copy()
+            motion_vals[mesh.path] = np.zeros((len(sample_tcs), 3), dtype=np.float64)
+            continue
         vals=[]
         for tc in sample_tcs:
             cache=UsdGeom.XformCache(Usd.TimeCode(float(tc)))
@@ -239,7 +418,12 @@ def load_scene(usd_file):
     print(f"USD fps/tps    : {fps:g} / {tps:g}")
 
     fluid_sources = []
+    granular_sources = []
     colliders = []
+    sinks = []
+    hinges = {}
+    dynamic_bodies = {}
+    collider_materials = {}
     reference_linear = {}
     reference_translation = {}
 
@@ -266,15 +450,50 @@ def load_scene(usd_file):
         if role in ("fluid", "source", "fluid_source"):
             fluid_sources.append(data)
             label = "FLUID SOURCE"
+        elif role in ("granular", "granular_source"):
+            granular_sources.append(GranularSourceData(
+                mesh=data,
+                source_mode=_string_attribute(prim, "grasph:sourceMode", "volume"),
+                particle_radius=_float_attribute(prim, "grasph:particleRadius", 0.025),
+                density=_float_attribute(prim, "grasph:density", 1600.0),
+                friction=_float_attribute(prim, "grasph:friction", 0.45),
+                restitution=_float_attribute(prim, "grasph:restitution", 0.10),
+                rolling_friction=_float_attribute(prim, "grasph:rollingFriction", 0.02),
+                flow_rate=_float_attribute(prim, "grasph:flowRate", 100.0),
+                initial_velocity=_vec3_attribute(
+                    prim, "grasph:initialVelocity", (0.0, 0.0, -1.0)
+                ),
+                start_time=_float_attribute(prim, "grasph:startTime", 0.0),
+                end_time=_float_attribute(prim, "grasph:endTime", 1.0),
+            ))
+            label = "GRANULAR SRC"
+        elif role == "sink":
+            sinks.append(data)
+            label = "SINK"
         elif role in ("ignore", "visual", "disabled"):
             continue
         else:
             colliders.append(data)
             label = "COLLIDER"
+            collider_materials[data.path] = {
+                "friction": max(0.0, _float_attribute(prim, "grasph:friction", 0.45)),
+                "restitution": float(np.clip(
+                    _float_attribute(prim, "grasph:restitution", 0.10), 0.0, 1.0
+                )),
+                "rolling_friction": max(
+                    0.0, _float_attribute(prim, "grasph:rollingFriction", 0.02)
+                ),
+            }
             xf = xcache.GetLocalToWorldTransform(prim)
             linear, translation = _matrix_parts(xf)
             reference_linear[data.path] = linear
             reference_translation[data.path] = translation
+            hinge = _hinge_for_prim(prim)
+            if hinge is not None:
+                hinges[data.path] = hinge
+            body = _dynamic_body_for_prim(prim)
+            if body is not None:
+                dynamic_bodies[data.path] = body
 
         print(f"  {label:<13}: {data.path}" + (f" ({len(triangles)} triangles)" if label == "COLLIDER" else ""))
         if label == "FLUID SOURCE":
@@ -285,12 +504,23 @@ def load_scene(usd_file):
 
     print()
     print(f"Fluid sources : {len(fluid_sources)}")
+    print(f"Granular sources: {len(granular_sources)}")
+    print(f"Sink volumes : {len(sinks)}")
     print(f"Collider meshes: {len(colliders)}")
+    print(f"Free axle hinges: {len(hinges)}")
+    print(f"Dynamic bodies : {len(dynamic_bodies)}")
+    for hinge in hinges.values():
+        print(
+            f"  {hinge.path}: axis={hinge.axis.astype(int)}, "
+            f"center={hinge.center}, I={hinge.moment_of_inertia:g} kg m2"
+        )
 
     scene = SceneData(
         stage=stage,
         fluid_sources=fluid_sources,
+        granular_sources=granular_sources,
         colliders=colliders,
+        sinks=sinks,
         source_file=str(Path(usd_file)),
         start_time_code=start_tc,
         end_time_code=end_tc,
@@ -301,11 +531,15 @@ def load_scene(usd_file):
         motion_time_codes={},
         motion_translations={},
         motion_driver_paths={},
+        hinges=hinges,
+        collider_materials=collider_materials,
+        dynamic_bodies=dynamic_bodies,
     )
 
     motion_t, motion_v, motion_drivers = _sample_motion_tables(
         stage, colliders, reference_linear, reference_translation,
-        start_tc, end_tc, tps, fps,
+        start_tc, end_tc, tps, fps, hinges=hinges,
+        dynamic_bodies=dynamic_bodies,
     )
     scene.motion_time_codes = motion_t
     scene.motion_translations = motion_v
@@ -370,3 +604,35 @@ def generate_fluid_particles(scene, dp):
     print()
     print(f"Total fluid particles: {len(out)}")
     return out
+
+
+def generate_granular_particles(scene):
+    """Fill granular source AABBs with non-overlapping sphere centers."""
+    positions = []
+    source_ids = []
+    print()
+    print("Generating granular particles...")
+    for source_id, source in enumerate(scene.granular_sources):
+        if source.source_mode == "flow":
+            continue
+        radius = float(source.particle_radius)
+        if not np.isfinite(radius) or radius <= 0.0:
+            raise RuntimeError(
+                f"Granular source {source.mesh.path} needs a positive particle radius"
+            )
+        diameter = 2.0 * radius
+        xs = _axis_centers(source.mesh.bounds_min[0], source.mesh.bounds_max[0], diameter)
+        ys = _axis_centers(source.mesh.bounds_min[1], source.mesh.bounds_max[1], diameter)
+        zs = _axis_centers(source.mesh.bounds_min[2], source.mesh.bounds_max[2], diameter)
+        if len(xs) and len(ys) and len(zs):
+            X, Y, Z = np.meshgrid(xs, ys, zs, indexing="ij")
+            pos = np.column_stack((X.ravel(), Y.ravel(), Z.ravel()))
+        else:
+            pos = np.empty((0, 3), dtype=np.float64)
+        positions.append(pos)
+        source_ids.append(np.full(len(pos), source_id, dtype=np.int32))
+        print(f"  {source.mesh.path}: {len(pos)} particles, radius={radius:g} m")
+
+    if not positions:
+        return np.empty((0, 3), dtype=np.float64), np.empty(0, dtype=np.int32)
+    return np.vstack(positions), np.concatenate(source_ids)

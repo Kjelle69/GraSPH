@@ -270,14 +270,17 @@ def build_colliders(scene, voxel_size=0.010, margin=0.040):
     print("========================================")
 
     for mesh in scene.colliders:
-        colliders.append(
-            DistanceFieldCollider(
-                name=mesh.path,
-                triangles=mesh.triangles,
-                voxel_size=voxel_size,
-                margin=margin,
-            )
+        collider = DistanceFieldCollider(
+            name=mesh.path,
+            triangles=mesh.triangles,
+            voxel_size=voxel_size,
+            margin=margin,
         )
+        material = getattr(scene, "collider_materials", {}).get(mesh.path, {})
+        collider.surface_friction = float(material.get("friction", 0.45))
+        collider.surface_restitution = float(material.get("restitution", 0.10))
+        collider.rolling_friction = float(material.get("rolling_friction", 0.02))
+        colliders.append(collider)
 
     print()
     print(f"Distance-field colliders: {len(colliders)}")
@@ -291,11 +294,21 @@ def resolve_collisions(
     particle_radius,
     restitution=0.0,
     tangential_keep=1.0,
+    friction_coefficient=None,
     iterations=2,
     collider_translations=None,
     collider_velocities=None,
+    collider_rotations=None,
+    collider_centers=None,
+    collider_angular_velocities=None,
+    particle_mass=None,
+    particle_angular_velocities=None,
+    particle_inertia=None,
+    particle_rolling_friction=None,
+    return_angular_impulses=False,
+    return_body_impulses=False,
 ):
-    """Geometric non-penetration only.
+    """Geometric non-penetration and velocity response.
 
     SPH wall physics is handled separately by the boundary module.
 
@@ -305,12 +318,39 @@ def resolve_collisions(
 
         x_local = x_world - translation.
 
-    For collision response, normal velocity is evaluated relative to the
-    collider velocity.  Rotation is intentionally not handled yet.
+    Rigid rotations are queried by transforming particles back into each
+    collider's reference frame.  When requested, the equal-and-opposite
+    angular impulse delivered to each collider is returned as well.
+
+    ``friction_coefficient`` selects a Coulomb impulse capped by the normal
+    collision impulse. When omitted, ``tangential_keep`` preserves the legacy
+    SPH collision response.
     """
     total_contacts = 0
     collider_translations = collider_translations or {}
     collider_velocities = collider_velocities or {}
+    collider_rotations = collider_rotations or {}
+    collider_centers = collider_centers or {}
+    collider_angular_velocities = collider_angular_velocities or {}
+    angular_impulses = {}
+    linear_impulses = {}
+    radii = np.asarray(particle_radius, dtype=np.float64)
+    per_particle_radius = radii.ndim > 0
+    masses = None if particle_mass is None else np.asarray(particle_mass, dtype=np.float64)
+    angular = particle_angular_velocities
+    inertias = (
+        None if particle_inertia is None
+        else np.asarray(particle_inertia, dtype=np.float64)
+    )
+    restitution_values = np.asarray(restitution, dtype=np.float64)
+    friction_values = (
+        None if friction_coefficient is None
+        else np.asarray(friction_coefficient, dtype=np.float64)
+    )
+    particle_rolling_values = (
+        None if particle_rolling_friction is None
+        else np.asarray(particle_rolling_friction, dtype=np.float64)
+    )
 
     for _ in range(iterations):
         for collider in colliders:
@@ -322,11 +362,22 @@ def resolve_collisions(
                 collider_velocities.get(collider.name, (0.0, 0.0, 0.0)),
                 dtype=np.float64,
             )
+            rotation = np.asarray(
+                collider_rotations.get(collider.name, np.eye(3)), dtype=np.float64
+            )
+            center = np.asarray(
+                collider_centers.get(collider.name, (0.0, 0.0, 0.0)), dtype=np.float64
+            )
+            angular_velocity = np.asarray(
+                collider_angular_velocities.get(collider.name, (0.0, 0.0, 0.0)),
+                dtype=np.float64,
+            )
 
-            # Translation-only local query. UDF normals are unchanged by a
-            # pure translation, so they are already valid in world space.
-            distance, normal = collider.query(pos - translation[None, :])
-            contact = distance < particle_radius
+            relative = pos - translation[None, :] - center[None, :]
+            query_pos = center[None, :] + relative @ rotation
+            distance, normal_local = collider.query(query_pos)
+            normal = normal_local @ rotation.T
+            contact = distance < radii
 
             if not np.any(contact):
                 continue
@@ -342,11 +393,30 @@ def resolve_collisions(
             if len(ids) == 0:
                 continue
 
-            penetration = particle_radius - distance[ids]
+            contact_radii = radii[ids] if per_particle_radius else radii
+            penetration = contact_radii - distance[ids]
             pos[ids] += n * penetration[:, None]
 
-            # Collision response in the moving wall frame.
-            rel_v = vel[ids] - wall_velocity[None, :]
+            # Collision response in the moving wall frame. The hinge center
+            # follows any authored translation while the angular velocity is
+            # evaluated at the corrected contact position.
+            lever = pos[ids] - (center + translation)[None, :]
+            contact_wall_velocity = (
+                wall_velocity[None, :] + np.cross(angular_velocity[None, :], lever)
+            )
+            if angular is not None:
+                contact_radii_for_velocity = (
+                    radii[ids] if per_particle_radius
+                    else np.full(len(ids), float(radii))
+                )
+                contact_arms = -n * contact_radii_for_velocity[:, None]
+                particle_contact_velocity = (
+                    vel[ids] + np.cross(angular[ids], contact_arms)
+                )
+                rel_v = particle_contact_velocity - contact_wall_velocity
+            else:
+                contact_arms = None
+                rel_v = vel[ids] - contact_wall_velocity
             vn = np.einsum("ij,ij->i", rel_v, n)
             incoming = vn < 0.0
 
@@ -355,18 +425,143 @@ def resolve_collisions(
                 hit_n = n[incoming]
                 hit_vn = vn[incoming]
                 hit_rel = rel_v[incoming]
+                before = vel[hit_ids].copy()
 
                 v_normal = hit_vn[:, None] * hit_n
                 v_tangent = hit_rel - v_normal
-
-                vel[hit_ids] = (
-                    wall_velocity[None, :]
-                    - restitution * v_normal
-                    + tangential_keep * v_tangent
+                hit_restitution = (
+                    restitution_values[hit_ids]
+                    if restitution_values.ndim > 0 else restitution_values
                 )
+                if angular is not None and masses is not None and inertias is not None:
+                    hit_mass = masses[hit_ids] if masses.ndim > 0 else np.full(
+                        len(hit_ids), float(masses)
+                    )
+                    hit_inertia = inertias[hit_ids] if inertias.ndim > 0 else np.full(
+                        len(hit_ids), float(inertias)
+                    )
+                    hit_radius = (
+                        radii[hit_ids] if per_particle_radius
+                        else np.full(len(hit_ids), float(radii))
+                    )
+                    hit_arm = contact_arms[incoming]
+                    particle_mu = (
+                        friction_values[hit_ids]
+                        if friction_values is not None and friction_values.ndim > 0
+                        else float(friction_values if friction_values is not None else 0.0)
+                    )
+                    wall_mu = float(getattr(collider, "surface_friction", 0.45))
+                    combined_mu = np.sqrt(np.maximum(0.0, particle_mu * wall_mu))
+                    wall_restitution = float(
+                        getattr(collider, "surface_restitution", 0.10)
+                    )
+                    combined_restitution = np.sqrt(
+                        np.maximum(0.0, hit_restitution * wall_restitution)
+                    )
+                    inv_mass = 1.0 / hit_mass
+                    normal_impulse = (
+                        -(1.0 + combined_restitution) * hit_vn / inv_mass
+                    )
+                    tangent_speed = np.linalg.norm(v_tangent, axis=1)
+                    tangent_direction = v_tangent / np.maximum(
+                        tangent_speed[:, None], 1.0e-12
+                    )
+                    tangent_effective_inverse_mass = (
+                        inv_mass + hit_radius**2 / hit_inertia
+                    )
+                    tangent_impulse = np.minimum(
+                        tangent_speed / tangent_effective_inverse_mass,
+                        combined_mu * normal_impulse,
+                    )
+                    particle_impulse = (
+                        normal_impulse[:, None] * hit_n
+                        - tangent_impulse[:, None] * tangent_direction
+                    )
+                    vel[hit_ids] += particle_impulse * inv_mass[:, None]
+                    angular[hit_ids] += (
+                        np.cross(hit_arm, particle_impulse) / hit_inertia[:, None]
+                    )
+
+                    particle_rolling = (
+                        particle_rolling_values[hit_ids]
+                        if particle_rolling_values is not None
+                        and particle_rolling_values.ndim > 0
+                        else float(
+                            particle_rolling_values
+                            if particle_rolling_values is not None else 0.02
+                        )
+                    )
+                    rolling_mu = np.sqrt(np.maximum(
+                        0.0, particle_rolling
+                        * float(getattr(collider, "rolling_friction", 0.02)),
+                    ))
+                    relative_omega = angular[hit_ids] - angular_velocity[None, :]
+                    rolling_omega = (
+                        relative_omega
+                        - np.einsum("ij,ij->i", relative_omega, hit_n)[:, None] * hit_n
+                    )
+                    rolling_speed = np.linalg.norm(rolling_omega, axis=1)
+                    max_angular_delta = (
+                        rolling_mu * normal_impulse * hit_radius / hit_inertia
+                    )
+                    angular_delta = np.minimum(rolling_speed, max_angular_delta)
+                    angular[hit_ids] -= (
+                        angular_delta[:, None]
+                        * rolling_omega / np.maximum(rolling_speed[:, None], 1.0e-12)
+                    )
+                elif friction_values is None:
+                    vel[hit_ids] = (
+                        contact_wall_velocity[incoming]
+                        - hit_restitution[..., None] * v_normal
+                        + tangential_keep * v_tangent
+                    )
+                else:
+                    # Normal impulse changes vn to -e*vn. Coulomb friction may
+                    # remove at most mu times that normal impulse; unlike the
+                    # legacy tangential multiplier this is not repeatedly
+                    # applied after the normal impact has already resolved.
+                    hit_friction = (
+                        friction_values[hit_ids]
+                        if friction_values.ndim > 0 else friction_values
+                    )
+                    normal_delta = (
+                        -(1.0 + hit_restitution) * hit_vn
+                    )
+                    tangent_speed = np.linalg.norm(v_tangent, axis=1)
+                    tangent_direction = v_tangent / np.maximum(
+                        tangent_speed[:, None], 1.0e-12
+                    )
+                    friction_delta = np.minimum(
+                        tangent_speed,
+                        np.maximum(0.0, hit_friction) * normal_delta,
+                    )
+                    new_relative = (
+                        hit_rel
+                        + normal_delta[:, None] * hit_n
+                        - friction_delta[:, None] * tangent_direction
+                    )
+                    vel[hit_ids] = contact_wall_velocity[incoming] + new_relative
+                if (return_angular_impulses or return_body_impulses) and particle_mass is not None:
+                    hit_masses = masses[hit_ids] if masses.ndim > 0 else masses
+                    fluid_impulse = hit_masses[..., None] * (vel[hit_ids] - before)
+                    reaction = -fluid_impulse
+                    linear_impulses[collider.name] = (
+                        linear_impulses.get(collider.name, np.zeros(3))
+                        + np.sum(reaction, axis=0)
+                    )
+                    contact_position = pos[hit_ids]
+                    if contact_arms is not None:
+                        contact_position = contact_position + contact_arms[incoming]
+                    hit_lever = contact_position - (center + translation)[None, :]
+                    impulse = np.sum(np.cross(hit_lever, reaction), axis=0)
+                    angular_impulses[collider.name] = (
+                        angular_impulses.get(collider.name, np.zeros(3)) + impulse
+                    )
 
             total_contacts += len(ids)
 
+    if return_body_impulses:
+        return total_contacts, linear_impulses, angular_impulses
+    if return_angular_impulses:
+        return total_contacts, angular_impulses
     return total_contacts
-
-

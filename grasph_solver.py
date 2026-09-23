@@ -43,6 +43,8 @@ class SolverSettings:
     detached_neighbor_max: int = 0
     droplet_mode: str = "components"
     wall_search: str = "cached"
+    granular_dt: float = 0.001
+    granular_iterations: int = 4
 
 
 @dataclass
@@ -68,6 +70,8 @@ class SimulationResult:
     steps: int
     surface_level: float
     cfg: SPHConfig
+    hinge_angles: dict = field(default_factory=dict)
+    hinge_angular_velocities: dict = field(default_factory=dict)
 
 
 def _fmt_time(seconds):
@@ -88,6 +92,21 @@ def _empty_wall_interactions():
     }
 
 
+def _sink_keep_mask(pos, sinks):
+    """Particles whose centers have not entered any sink volume."""
+    keep = np.ones(len(pos), dtype=bool)
+    for sink in sinks:
+        keep &= ~np.all((pos >= sink.bounds_min) & (pos <= sink.bounds_max), axis=1)
+    return keep
+
+
+def _pad_frames(frames, capacity, trailing_shape=(), dtype=np.float32, fill=np.nan):
+    out = np.full((len(frames), capacity) + trailing_shape, fill, dtype=dtype)
+    for i, frame in enumerate(frames):
+        out[i, :len(frame)] = frame
+    return out
+
+
 
 def _translation_array_for_boundary(boundary, translations):
     out = np.zeros_like(boundary.positions, dtype=np.float64)
@@ -98,19 +117,56 @@ def _translation_array_for_boundary(boundary, translations):
     return out
 
 
-def _apply_boundary_translation(boundary, base_positions, base_facing, translations):
+def _axis_angle_matrix(axis, angle):
+    axis = np.asarray(axis, dtype=np.float64)
+    x, y, z = axis / np.linalg.norm(axis)
+    c, s, q = np.cos(angle), np.sin(angle), 1.0 - np.cos(angle)
+    return np.array([
+        [c + x*x*q, x*y*q - z*s, x*z*q + y*s],
+        [y*x*q + z*s, c + y*y*q, y*z*q - x*s],
+        [z*x*q - y*s, z*y*q + x*s, c + z*z*q],
+    ], dtype=np.float64)
+
+
+def _apply_boundary_motion(
+    boundary, base_positions, base_normals, base_facing, translations,
+    rotations=None, centers=None,
+):
     shift = _translation_array_for_boundary(boundary, translations)
     boundary.positions[:] = base_positions + shift
+    boundary.normals[:] = base_normals
     if boundary.facing_positions is not None and base_facing is not None:
         boundary.facing_positions[:] = base_facing + shift
+    rotations = rotations or {}
+    centers = centers or {}
+    for source_id, path in enumerate(boundary.source_paths):
+        if path not in rotations:
+            continue
+        mask = boundary.source_ids == source_id
+        rotation = rotations[path]
+        center = np.asarray(centers[path], dtype=np.float64)
+        path_shift = np.asarray(translations.get(path, (0.0, 0.0, 0.0)), dtype=np.float64)
+        boundary.positions[mask] = (
+            center + (base_positions[mask] - center) @ rotation.T + path_shift
+        )
+        boundary.normals[mask] = base_normals[mask] @ rotation.T
+        if boundary.facing_positions is not None and base_facing is not None:
+            boundary.facing_positions[mask] = (
+                center + (base_facing[mask] - center) @ rotation.T + path_shift
+            )
 
 
-def _boundary_velocity_array(boundary, velocities):
+def _boundary_velocity_array(boundary, velocities, angular_velocities=None, centers=None, translations=None):
     out = np.zeros_like(boundary.positions, dtype=np.float64)
     for source_id, path in enumerate(boundary.source_paths):
         mask = boundary.source_ids == source_id
         if np.any(mask):
             out[mask] = np.asarray(velocities.get(path, (0.0, 0.0, 0.0)), dtype=np.float64)
+            if angular_velocities and path in angular_velocities:
+                center = np.asarray(centers[path], dtype=np.float64)
+                shift = np.asarray((translations or {}).get(path, (0.0, 0.0, 0.0)))
+                lever = boundary.positions[mask] - (center + shift)[None, :]
+                out[mask] += np.cross(angular_velocities[path][None, :], lever)
     return out
 
 
@@ -126,12 +182,45 @@ def _translated_solid_triangles(base_triangles, triangle_paths, translations):
     return out
 
 
+def _rigid_solid_geometry(base_triangles, base_normals, triangle_paths, translations,
+                          rotations=None, centers=None):
+    triangles = _translated_solid_triangles(base_triangles, triangle_paths, translations)
+    normals = np.asarray(base_normals, dtype=np.float64).copy()
+    paths = np.asarray(triangle_paths, dtype=object)
+    for path, rotation in (rotations or {}).items():
+        mask = paths == path
+        if not np.any(mask):
+            continue
+        center = np.asarray(centers[path], dtype=np.float64)
+        shift = np.asarray(translations.get(path, (0.0, 0.0, 0.0)), dtype=np.float64)
+        triangles[mask] = center + (base_triangles[mask] - center) @ rotation.T + shift
+        normals[mask] = base_normals[mask] @ rotation.T
+    return triangles, normals
+
+
 def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
     sph_cfg = sph_cfg or SPHConfig()
     settings = settings or SolverSettings()
     hooks = hooks or SimulationHooks()
     fs_cfg = settings.free_surface
     configure_neighbor_search(settings.neighbor_backend, settings.neighbor_workers)
+
+    scene = load_scene(usd_file)
+    if scene.granular_sources:
+        if scene.fluid_sources:
+            raise RuntimeError(
+                "Mixed fluid/granular simulation is not implemented yet; "
+                "use either Fluid Volume or Granular Source."
+            )
+        from grasph_granular import run_granular_simulation
+        return run_granular_simulation(
+            usd_file, scene, settings, gravity=sph_cfg.gravity
+        )
+    if scene.dynamic_bodies:
+        raise RuntimeError(
+            "Dynamic Body is currently supported by granular simulations only; "
+            "use Dynamic Hinge for WCSPH."
+        )
 
     kernel = WendlandC2(sph_cfg.h)
     particle_radius = settings.particle_radius_factor * sph_cfg.dp
@@ -141,7 +230,7 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
     usd_output = out_dir / f"{stem}.usdc"
 
     print("\n========================================")
-    print("GraSPH v0.54 FIX7 - CACHED TRANSLATION-ONLY WALL SEARCH")
+    print("GraSPH v0.54 - USD KINEMATICS + DYNAMIC AXLE HINGES")
     print("========================================")
     print(f"Scene        : {usd_file}")
     print(f"dp/h/support : {sph_cfg.dp:.4f} / {sph_cfg.h:.4f} / {sph_cfg.support:.4f} m")
@@ -158,11 +247,13 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
     else:
         print(f"droplet fallback: fluid neighbors <= {settings.detached_neighbor_max}")
 
-    scene = load_scene(usd_file)
     pos = generate_fluid_particles(scene, dp=sph_cfg.dp)
     if len(pos) == 0:
         raise RuntimeError("No fluid particles generated. Use a FluidVolume mesh or grasph:role='fluid'.")
     n = len(pos)
+    capacity = n
+    particle_ids = np.arange(n, dtype=np.int32)
+    removed_count = 0
     vel = np.zeros_like(pos, dtype=np.float64)
 
     gvec = np.asarray(sph_cfg.gravity, dtype=np.float64)
@@ -181,21 +272,36 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
     surface_boundary = build_boundary_particles(scene, spacing=sph_cfg.dp)
     boundary = build_layered_wall_particles(surface_boundary, sph_cfg.dp, sph_cfg.support, sph_cfg.rho0)
     base_boundary_positions = boundary.positions.copy()
+    base_boundary_normals = boundary.normals.copy()
     wall_search = CachedWallNeighborSearch(boundary) if settings.wall_search == "cached" else None
     base_facing_positions = None if boundary.facing_positions is None else boundary.facing_positions.copy()
     wall_velocity = np.zeros_like(boundary.positions, dtype=np.float64)
-    solid_triangles_base, solid_normals, solid_triangle_paths = collider_triangle_data(scene)
+    solid_triangles_base, solid_normals_base, solid_triangle_paths = collider_triangle_data(scene)
+
+    hinge_states = {
+        path: {"angle": 0.0, "omega": 0.0, "torque": 0.0}
+        for path in scene.hinges
+    }
+    hinge_centers = {path: hinge.center for path, hinge in scene.hinges.items()}
 
     # Reference pose is the USD stage start time. Any animated collider is
     # sampled in source-scene seconds from there. v0.54 supports pure
     # translation (perfect for a vertically lifted gate).
     motion0 = scene.collider_motion(0.0) if scene.colliders else {}
-    _apply_boundary_translation(boundary, base_boundary_positions, base_facing_positions, motion0)
-    solid_triangles = _translated_solid_triangles(solid_triangles_base, solid_triangle_paths, motion0)
+    _apply_boundary_motion(
+        boundary, base_boundary_positions, base_boundary_normals,
+        base_facing_positions, motion0,
+    )
+    solid_triangles, solid_normals = _rigid_solid_geometry(
+        solid_triangles_base, solid_normals_base, solid_triangle_paths, motion0
+    )
 
     frame_positions, frame_velocity, frame_rho, frame_rho_ref = [], [], [], []
     frame_q, frame_times = [], []
     frame_shell, frame_band, frame_hG, frame_detached = [], [], [], []
+    frame_ids = []
+    frame_hinge_angles, frame_hinge_omegas = [], []
+    hinge_paths = list(scene.hinges)
 
     def snapshot(t, state=None, detached=None):
         rr, pp, _ = hydrostatic_reference_state(pos, surface_level, sph_cfg, return_depth=True)
@@ -209,6 +315,7 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
             pp[detached] = 0.0
         qq = compute_pressure(rho, sph_cfg.rho0, sph_cfg.tait_B, sph_cfg.gamma) - pp
         frame_positions.append(pos.copy())
+        frame_ids.append(particle_ids.copy())
         frame_velocity.append(vel.copy())
         frame_rho.append(rho.copy())
         frame_rho_ref.append(rr.copy())
@@ -223,6 +330,12 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
             frame_band.append(state["band"].astype(np.uint8).copy())
             frame_hG.append(state["support_hG"].astype(np.float32).copy())
         frame_detached.append(detached.astype(np.uint8).copy())
+        frame_hinge_angles.append(
+            np.asarray([hinge_states[path]["angle"] for path in hinge_paths], dtype=np.float64)
+        )
+        frame_hinge_omegas.append(
+            np.asarray([hinge_states[path]["omega"] for path in hinge_paths], dtype=np.float64)
+        )
 
     pair_i0, pair_j0 = build_neighbor_pairs(pos, sph_cfg.support)
     counts0 = neighbor_counts(n, pair_i0, pair_j0)
@@ -256,7 +369,7 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
         "sph_forces": 0.0,
         "collision": 0.0,
     }
-    detached_ever = np.zeros(n, dtype=bool)
+    detached_ever = np.zeros(capacity, dtype=bool)
     current_ncomp = int(ncomp0)
     current_main_size = int(sizes0.max()) if len(sizes0) else 0
 
@@ -295,10 +408,25 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
             motion_next = {}
             collider_velocities = {}
 
-        _apply_boundary_translation(boundary, base_boundary_positions, base_facing_positions, motion_now)
-        wall_velocity = _boundary_velocity_array(boundary, collider_velocities)
-        solid_triangles = _translated_solid_triangles(
-            solid_triangles_base, solid_triangle_paths, motion_now
+        collider_rotations = {
+            path: _axis_angle_matrix(scene.hinges[path].axis, state["angle"])
+            for path, state in hinge_states.items()
+        }
+        collider_angular_velocities = {
+            path: scene.hinges[path].axis * state["omega"]
+            for path, state in hinge_states.items()
+        }
+        _apply_boundary_motion(
+            boundary, base_boundary_positions, base_boundary_normals,
+            base_facing_positions, motion_now, collider_rotations, hinge_centers,
+        )
+        wall_velocity = _boundary_velocity_array(
+            boundary, collider_velocities, collider_angular_velocities,
+            hinge_centers, motion_now,
+        )
+        solid_triangles, solid_normals = _rigid_solid_geometry(
+            solid_triangles_base, solid_normals_base, solid_triangle_paths,
+            motion_now, collider_rotations, hinge_centers,
         )
 
         _tp = time.perf_counter()
@@ -317,7 +445,7 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
             detached = counts <= settings.detached_neighbor_max
             current_ncomp = 1 + int(np.any(detached))
             current_main_size = int(n - np.count_nonzero(detached))
-        detached_ever |= detached
+        detached_ever[particle_ids] |= detached
         perf["droplet_components"] += time.perf_counter() - _tp
 
         rho_ref, p_ref, depth_ref = hydrostatic_reference_state(pos, surface_level, sph_cfg, return_depth=True)
@@ -335,7 +463,10 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
 
         need_wall = settings.enable_wall_pressure or settings.enable_wall_continuity or fs_cfg.mode != "none"
         _tp = time.perf_counter()
-        wall_interactions = build_wall_interactions(pos, boundary, kernel, sph_cfg.support, wall_search, motion_now) if (need_wall and len(boundary.positions)) else _empty_wall_interactions()
+        active_wall_search = None if hinge_states else wall_search
+        wall_interactions = build_wall_interactions(
+            pos, boundary, kernel, sph_cfg.support, active_wall_search, motion_now
+        ) if (need_wall and len(boundary.positions)) else _empty_wall_interactions()
         perf["wall_interactions"] += time.perf_counter() - _tp
         wall_rho_ref, _, _ = hydrostatic_reference_state(boundary.positions, surface_level, sph_cfg, return_depth=True)
 
@@ -349,11 +480,32 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
 
         _tp = time.perf_counter()
         acc_q = compute_pressure_acceleration(rho, q, pair_i, pair_j, gradW, sph_cfg.mass)
+        wall_pair_j = np.empty(0, dtype=np.int32)
+        wall_pair_acceleration = np.empty((0, 3), dtype=np.float64)
         if settings.enable_wall_pressure and len(boundary.positions):
             q_wall = np.zeros(len(boundary.positions), dtype=np.float64)
-            add_static_wall_pressure_acceleration(
+            wall_pair_j, wall_pair_acceleration = add_static_wall_pressure_acceleration(
                 acc_q, rho, q, boundary, wall_interactions, wall_rho_ref, q_wall
             )
+
+        pressure_torques = {path: 0.0 for path in hinge_states}
+        if len(wall_pair_j) and hinge_states:
+            reaction_forces = -sph_cfg.mass * wall_pair_acceleration
+            for source_id, path in enumerate(boundary.source_paths):
+                if path not in hinge_states:
+                    continue
+                pair_mask = boundary.source_ids[wall_pair_j] == source_id
+                if not np.any(pair_mask):
+                    continue
+                boundary_ids = wall_pair_j[pair_mask]
+                center = scene.hinges[path].center + np.asarray(
+                    motion_now.get(path, (0.0, 0.0, 0.0)), dtype=np.float64
+                )
+                lever = boundary.positions[boundary_ids] - center[None, :]
+                torque_vectors = np.cross(lever, reaction_forces[pair_mask])
+                pressure_torques[path] = float(
+                    np.sum(torque_vectors @ scene.hinges[path].axis)
+                )
 
         acc_base = compute_well_balanced_base_acceleration(rho, rho_ref, depth_ref, sph_cfg.gravity)
         acc_visc = compute_artificial_viscosity_acceleration(
@@ -378,7 +530,7 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
 
         _tp = time.perf_counter()
         if settings.enable_collision and colliders:
-            contacts = resolve_collisions(
+            contacts, angular_impulses = resolve_collisions(
                 pos, vel, colliders,
                 particle_radius=particle_radius,
                 restitution=0.0,
@@ -386,24 +538,63 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
                 iterations=settings.collision_iterations,
                 collider_translations=motion_next,
                 collider_velocities=collider_velocities,
+                collider_rotations=collider_rotations,
+                collider_centers=hinge_centers,
+                collider_angular_velocities=collider_angular_velocities,
+                particle_mass=sph_cfg.mass,
+                return_angular_impulses=True,
             )
         else:
             contacts = 0
+            angular_impulses = {}
         total_contacts += contacts
         perf["collision"] += time.perf_counter() - _tp
+
+        # The axle removes translation and all off-axis rotation. Pressure
+        # supplies torque over dt; collision response supplies an impulse.
+        for path, state in hinge_states.items():
+            hinge = scene.hinges[path]
+            torque = pressure_torques.get(path, 0.0)
+            impulse = float(np.dot(
+                angular_impulses.get(path, np.zeros(3)), hinge.axis
+            ))
+            state["omega"] += (torque * dt + impulse) / hinge.moment_of_inertia
+            state["omega"] /= 1.0 + hinge.angular_damping * dt / hinge.moment_of_inertia
+            if hinge.max_angular_speed > 0.0:
+                state["omega"] = float(np.clip(
+                    state["omega"], -hinge.max_angular_speed, hinge.max_angular_speed
+                ))
+            state["angle"] += state["omega"] * dt
+            state["torque"] = torque
+
+        if scene.sinks:
+            keep = _sink_keep_mask(pos, scene.sinks)
+            removed_count += int(np.count_nonzero(~keep))
+            if not np.all(keep):
+                pos, vel, rho = pos[keep], vel[keep], rho[keep]
+                particle_ids = particle_ids[keep]
+                detached = detached[keep]
+                for key in ("shell", "band", "support_hG"):
+                    fs_state[key] = fs_state[key][keep]
+                n = len(pos)
 
         t += dt
         step += 1
 
         if not (np.all(np.isfinite(pos)) and np.all(np.isfinite(vel)) and np.all(np.isfinite(rho))):
             raise RuntimeError("Non-finite solver state.")
-        if rho.min() < 0.5 * sph_cfg.rho0 or rho.max() > 1.5 * sph_cfg.rho0:
+        if n and (rho.min() < 0.5 * sph_cfg.rho0 or rho.max() > 1.5 * sph_cfg.rho0):
             raise RuntimeError(f"Density instability: {rho.min():.1f} .. {rho.max():.1f} kg/m3")
 
         if t + 1e-12 >= next_output:
             snapshot(t, fs_state, detached)
             while next_output <= t + 1e-12:
                 next_output += output_interval
+
+        if n == 0:
+            snapshot(t, fs_state, detached)
+            print(f"All {removed_count} particles entered sink volumes at t={t:.4f}s")
+            break
 
         now = time.perf_counter()
         if now - last_report >= settings.report_interval or t >= settings.sim_time - 1e-15:
@@ -430,21 +621,29 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
                 f"| band={np.count_nonzero(fs_state['band'])} | detached={np.count_nonzero(detached)} "
                 f"| comps={current_ncomp} main={current_main_size} | contacts={contacts}" + kin_text
             )
+            for path, state in hinge_states.items():
+                print(
+                    f"    axle {Path(path).name}: angle={np.degrees(state['angle']):+.2f}deg "
+                    f"omega={state['omega']:+.3f}rad/s torque={state['torque']:+.5f}Nm"
+                )
             last_report = now
 
     if frame_times[-1] < t - 1e-12:
         snapshot(t, fs_state, detached)
 
     arrays = dict(
-        positions=np.asarray(frame_positions, dtype=np.float32),
-        velocity=np.asarray(frame_velocity, dtype=np.float32),
-        rho=np.asarray(frame_rho, dtype=np.float32),
-        rho_reference=np.asarray(frame_rho_ref, dtype=np.float32),
-        reduced_pressure=np.asarray(frame_q, dtype=np.float32),
-        atmospheric_mask=np.asarray(frame_shell, dtype=np.uint8),
-        traction_band_mask=np.asarray(frame_band, dtype=np.uint8),
-        current_surface_hG=np.asarray(frame_hG, dtype=np.float32),
-        detached_mask=np.asarray(frame_detached, dtype=np.uint8),
+        positions=_pad_frames(frame_positions, capacity, (3,)),
+        velocity=_pad_frames(frame_velocity, capacity, (3,)),
+        rho=_pad_frames(frame_rho, capacity),
+        rho_reference=_pad_frames(frame_rho_ref, capacity),
+        reduced_pressure=_pad_frames(frame_q, capacity),
+        atmospheric_mask=_pad_frames(frame_shell, capacity, dtype=np.uint8, fill=0),
+        traction_band_mask=_pad_frames(frame_band, capacity, dtype=np.uint8, fill=0),
+        current_surface_hG=_pad_frames(frame_hG, capacity),
+        detached_mask=_pad_frames(frame_detached, capacity, dtype=np.uint8, fill=0),
+        active_particle_ids=_pad_frames(frame_ids, capacity, dtype=np.int32, fill=-1),
+        active_counts=np.asarray([len(ids) for ids in frame_ids], dtype=np.int32),
+        removed_count=np.asarray(removed_count, dtype=np.int32),
         times=np.asarray(frame_times, dtype=np.float64),
         source_file=np.asarray(str(usd_file)),
         surface_level=np.asarray(surface_level),
@@ -453,12 +652,24 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
         free_surface_mode=np.asarray(fs_cfg.mode),
         usd_start_time_code=np.asarray(scene.start_time_code),
         usd_time_codes_per_second=np.asarray(scene.time_codes_per_second),
+        hinge_paths=np.asarray(hinge_paths),
+        hinge_angles=np.asarray(frame_hinge_angles, dtype=np.float64),
+        hinge_angular_velocities=np.asarray(frame_hinge_omegas, dtype=np.float64),
     )
     print("\nWriting outputs...")
     save_npz(npz_output, **arrays)
     write_usd_animation(
         scene.stage, frame_positions, frame_times, settings.output_fps, sph_cfg.dp, usd_output,
         source_start_time_code=scene.start_time_code, source_tps=scene.time_codes_per_second,
+        frame_velocities=frame_velocity,
+        hinge_frames={
+            path: {
+                "driver_path": scene.hinges[path].driver_path,
+                "axis": scene.hinges[path].axis,
+                "angles": np.asarray(frame_hinge_angles)[:, i],
+            }
+            for i, path in enumerate(hinge_paths)
+        },
     )
 
     elapsed = time.perf_counter() - start
@@ -471,12 +682,20 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
     print(f"Steps          : {step}")
     print(f"Solver wall    : {elapsed:.3f} s")
     print(f"Average rate   : {step/elapsed:.1f} step/s" if elapsed > 0 else "Average rate   : n/a")
-    print(f"rho min/mean/max : {rho.min():.4f} / {rho.mean():.4f} / {rho.max():.4f}")
-    print(f"rho-ref abs mean/max: {np.mean(np.abs(rho-rr)):.6f} / {np.max(np.abs(rho-rr)):.6f} kg/m3")
-    print(f"q abs mean/max  : {np.mean(np.abs(qq)):.3f} / {np.max(np.abs(qq)):.3f} Pa")
-    print(f"v max           : {np.linalg.norm(vel, axis=1).max():.6f} m/s")
+    if n:
+        print(f"rho min/mean/max : {rho.min():.4f} / {rho.mean():.4f} / {rho.max():.4f}")
+    if n:
+        print(f"rho-ref abs mean/max: {np.mean(np.abs(rho-rr)):.6f} / {np.max(np.abs(rho-rr)):.6f} kg/m3")
+        print(f"q abs mean/max  : {np.mean(np.abs(qq)):.3f} / {np.max(np.abs(qq)):.3f} Pa")
+    print(f"v max           : {np.linalg.norm(vel, axis=1).max():.6f} m/s" if n else "v max           : n/a")
+    print(f"Sink removed    : {removed_count} / {capacity}")
     print(f"Contacts        : {total_contacts}")
     print(f"Kinematic max travel seen: {max_collider_travel_seen:.6f} m")
+    for path, state in hinge_states.items():
+        print(
+            f"Axle {Path(path).name}: angle={np.degrees(state['angle']):+.3f} deg, "
+            f"omega={state['omega']:+.6f} rad/s"
+        )
     print(f"Surface shell   : {np.count_nonzero(fs_state['shell'])} / {n}")
     print(f"Traction band   : {np.count_nonzero(fs_state['band'])} / {n}")
     print(f"Detached now/ever: {np.count_nonzero(detached)} / {np.count_nonzero(detached_ever)}")
@@ -493,4 +712,6 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
         scene_file=str(usd_file), npz_file=str(npz_output), usd_file=str(usd_output),
         positions=pos.copy(), velocity=vel.copy(), rho=rho.copy(), time=t, steps=step,
         surface_level=surface_level, cfg=sph_cfg,
+        hinge_angles={path: state["angle"] for path, state in hinge_states.items()},
+        hinge_angular_velocities={path: state["omega"] for path, state in hinge_states.items()},
     )

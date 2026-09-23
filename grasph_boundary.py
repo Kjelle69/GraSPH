@@ -1333,7 +1333,7 @@ def add_static_wall_pressure_acceleration(
     pair_j = interactions["pair_j"]
 
     if len(pair_i) == 0:
-        return
+        return pair_j, np.empty((0, 3), dtype=np.float64)
 
     gradW = interactions["gradW"]
 
@@ -1355,9 +1355,9 @@ def add_static_wall_pressure_acceleration(
         )
     )
 
-    acc += _scatter_add_vec3(
-        len(acc), pair_i, -factor[:, None] * gradW
-    )
+    pair_acceleration = -factor[:, None] * gradW
+    acc += _scatter_add_vec3(len(acc), pair_i, pair_acceleration)
+    return pair_j, pair_acceleration
 
 # ============================================================
 # USD PREVIEW

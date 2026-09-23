@@ -6,7 +6,7 @@ from grasph_scene import load_scene
 
 
 def main():
-    p = argparse.ArgumentParser(description="GraSPH v0.54 FIX7: USD kinematics + cached translation-only wall search")
+    p = argparse.ArgumentParser(description="GraSPH: USD kinematics, dynamic hinges, and WCSPH")
     p.add_argument("usd", help="Input .usd/.usda/.usdc scene")
     p.add_argument("--time", type=float, default=0.50, help="Simulation time [s]")
     p.add_argument("--dp", type=float, default=0.020, help="Particle spacing [m]")
@@ -28,7 +28,11 @@ def main():
     p.add_argument("--droplet-neighbors", type=int, default=0,
                    help="Legacy cutoff used only with --droplet-mode zero")
     p.add_argument("--wall-search", choices=["cached", "rebuild"], default="cached",
-                   help="Reuse translation-only collider trees or rebuild the reference search each step")
+                   help="Reuse translated-collider trees or rebuild the reference search each step")
+    p.add_argument("--granular-dt", type=float, default=0.001,
+                   help="Maximum granular solver timestep [s]")
+    p.add_argument("--granular-iterations", type=int, default=4,
+                   help="Sphere contact projection iterations per step")
     args = p.parse_args()
 
     if args.inspect_motion:
@@ -51,6 +55,8 @@ def main():
         detached_neighbor_max=max(0, args.droplet_neighbors),
         droplet_mode=args.droplet_mode,
         wall_search=args.wall_search,
+        granular_dt=max(1.0e-6, args.granular_dt),
+        granular_iterations=max(1, args.granular_iterations),
     )
     run_simulation(args.usd, sph_cfg=cfg, settings=settings)
 
