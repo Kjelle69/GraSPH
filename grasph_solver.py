@@ -3,7 +3,7 @@ from pathlib import Path
 import time
 import numpy as np
 
-from grasph_scene import load_scene, generate_fluid_particles
+from grasph_scene import load_scene, generate_fluid_particles, generate_granular_particles
 from grasph_sph import (
     SPHConfig, WendlandC2, build_neighbor_pairs, compute_pair_geometry,
     neighbor_counts, compute_density_rate, compute_pressure,
@@ -20,6 +20,12 @@ from grasph_boundary import (
 from grasph_reference import hydrostatic_reference_state, compute_well_balanced_base_acceleration
 from grasph_free_surface import FreeSurfaceConfig, collider_triangle_data, compute_atmospheric_state
 from grasph_output import save_npz, write_usd_animation
+from grasph_coupling import couple_fluid_grains
+from grasph_granular import (
+    _append_particles as append_grains,
+    _flow_candidates as grain_flow_candidates,
+    resolve_grain_contacts,
+)
 from grasph_rigid import (
     advance_rotation, resolve_body_contacts, rotation_to_euler_xyz, world_inertia,
 )
@@ -210,12 +216,7 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
     configure_neighbor_search(settings.neighbor_backend, settings.neighbor_workers)
 
     scene = load_scene(usd_file)
-    if scene.granular_sources:
-        if scene.fluid_sources:
-            raise RuntimeError(
-                "Mixed fluid/granular simulation is not implemented yet; "
-                "use either Fluid Volume or Granular Source."
-            )
+    if scene.granular_sources and not scene.fluid_sources:
         from grasph_granular import run_granular_simulation
         return run_granular_simulation(
             usd_file, scene, settings, gravity=sph_cfg.gravity
@@ -229,7 +230,7 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
     usd_output = out_dir / f"{stem}.usdc"
 
     print("\n========================================")
-    print("GraSPH v0.54 - USD KINEMATICS + DYNAMIC AXLE HINGES")
+    print("GraSPH v0.7 - COUPLED SPH + GRANULAR DEM/PBD")
     print("========================================")
     print(f"Scene        : {usd_file}")
     print(f"dp/h/support : {sph_cfg.dp:.4f} / {sph_cfg.h:.4f} / {sph_cfg.support:.4f} m")
@@ -261,6 +262,45 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
     surface_level = float(np.max(pos @ up) + 0.5 * sph_cfg.dp)
     rho_ref, p_ref, _ = hydrostatic_reference_state(pos, surface_level, sph_cfg, return_depth=True)
     rho = rho_ref.copy()
+
+    # Mixed mode: spherical DEM grains share the WCSPH timestep. This keeps
+    # the fast neighbour pipeline and avoids a second global solver loop.
+    grain_pos, grain_source_ids = generate_granular_particles(scene)
+    grain_sources = scene.granular_sources
+    grain_radii = np.asarray([
+        grain_sources[index].particle_radius for index in grain_source_ids
+    ], dtype=np.float64)
+    grain_density = np.asarray([
+        grain_sources[index].density for index in grain_source_ids
+    ], dtype=np.float64)
+    grain_friction = np.asarray([
+        grain_sources[index].friction for index in grain_source_ids
+    ], dtype=np.float64)
+    grain_restitution = np.asarray([
+        grain_sources[index].restitution for index in grain_source_ids
+    ], dtype=np.float64)
+    grain_rolling = np.asarray([
+        grain_sources[index].rolling_friction for index in grain_source_ids
+    ], dtype=np.float64)
+    grain_masses = grain_density * (4.0 / 3.0) * np.pi * grain_radii**3
+    grain_inertia = 0.4 * grain_masses * grain_radii**2
+    grain_vel = np.zeros_like(grain_pos)
+    grain_omega = np.zeros_like(grain_pos)
+    grain_ids = np.arange(len(grain_pos), dtype=np.int32)
+    next_grain_id = len(grain_pos)
+    grain_flow_states = []
+    for source in grain_sources:
+        if source.source_mode != "flow":
+            continue
+        candidates = grain_flow_candidates(source)
+        if not len(candidates):
+            raise RuntimeError(
+                f"Granular Flow Source {source.mesh.path} is too small for its radius"
+            )
+        grain_flow_states.append({
+            "source": source, "candidates": candidates, "cursor": 0,
+            "remainder": 0.0, "emitted": 0, "blocked": 0,
+        })
 
     colliders = build_colliders(
         scene,
@@ -315,6 +355,8 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
     hinge_paths = list(scene.hinges)
     frame_body_translations = {path: [] for path in body_paths}
     frame_body_rotations = {path: [] for path in body_paths}
+    frame_grain_positions, frame_grain_velocities = [], []
+    frame_grain_radii, frame_grain_ids = [], []
 
     def snapshot(t, state=None, detached=None):
         rr, pp, _ = hydrostatic_reference_state(pos, surface_level, sph_cfg, return_depth=True)
@@ -354,6 +396,10 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
             frame_body_rotations[path].append(
                 rotation_to_euler_xyz(body_states[path]["rotation"])
             )
+        frame_grain_positions.append(grain_pos.copy())
+        frame_grain_velocities.append(grain_vel.copy())
+        frame_grain_radii.append(grain_radii.copy())
+        frame_grain_ids.append(grain_ids.copy())
 
     pair_i0, pair_j0 = build_neighbor_pairs(pos, sph_cfg.support)
     counts0 = neighbor_counts(n, pair_i0, pair_j0)
@@ -394,6 +440,8 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
     print("\n========================================")
     print("STARTING GENERIC WCSPH")
     print(f"Fluid/solid coupling: {'ON' if body_states else 'OFF'}")
+    if grain_sources:
+        print(f"Fluid/granular coupling: ON ({len(grain_pos)} initial grains)")
     print("========================================\n")
 
     while t < settings.sim_time - 1e-15:
@@ -411,6 +459,41 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
             state["velocity"] += np.asarray(sph_cfg.gravity) * dt
             state["velocity"] /= 1.0 + body.linear_damping * dt
             state["omega"] /= 1.0 + body.angular_damping * dt
+
+        for flow in grain_flow_states:
+            source = flow["source"]
+            active_dt = max(
+                0.0, min(t + dt, source.end_time) - max(t, source.start_time)
+            )
+            flow["remainder"] += source.flow_rate * active_dt
+            requested = int(np.floor(flow["remainder"] + 1.0e-12))
+            flow["remainder"] -= requested
+            accepted = []
+            for _ in range(requested):
+                candidate = flow["candidates"][flow["cursor"]].copy()
+                flow["cursor"] = (flow["cursor"] + 1) % len(flow["candidates"])
+                if len(grain_pos) and np.any(
+                    np.linalg.norm(grain_pos - candidate[None, :], axis=1)
+                    < grain_radii + source.particle_radius * 0.98
+                ):
+                    flow["blocked"] += 1
+                    continue
+                if accepted and np.any(
+                    np.linalg.norm(np.asarray(accepted) - candidate[None, :], axis=1)
+                    < 1.96 * source.particle_radius
+                ):
+                    flow["blocked"] += 1
+                    continue
+                accepted.append(candidate)
+            if accepted:
+                (grain_pos, grain_vel, grain_omega, grain_radii, grain_masses,
+                 grain_inertia, grain_friction, grain_restitution, grain_rolling,
+                 grain_ids, next_grain_id) = append_grains(
+                    grain_pos, grain_vel, grain_omega, grain_radii, grain_masses,
+                    grain_inertia, grain_friction, grain_restitution, grain_rolling,
+                    grain_ids, np.asarray(accepted), source, next_grain_id,
+                )
+                flow["emitted"] += len(accepted)
 
         # Sample Blender/OpenUSD collider transforms at the current and next
         # solver times. Distance fields remain in their reference pose and are
@@ -559,7 +642,15 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
             sph_cfg.mass, sph_cfg.h, sph_cfg.c0,
             alpha=settings.viscosity_alpha,
         )
-        acc = acc_q + acc_base + acc_visc + fs_state["acc"] + hooks.acceleration(t)[None, :]
+        fluid_grain_acc, grain_hydro_acc, fluid_grain_pairs = couple_fluid_grains(
+            pos, vel, rho, sph_cfg.mass,
+            grain_pos, grain_vel, grain_radii, grain_masses,
+            sph_cfg.gravity, sph_cfg.support,
+        )
+        acc = (
+            acc_q + acc_base + acc_visc + fs_state["acc"]
+            + hooks.acceleration(t)[None, :] + fluid_grain_acc
+        )
 
         # Symplectic kick -> continuity -> drift. This is the frozen v0.16+
         # bulk update; v0.53 changes architecture, not timestep physics.
@@ -602,6 +693,43 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
             linear_impulses = {}
         total_contacts += contacts
         perf["collision"] += time.perf_counter() - _tp
+
+        grain_pair_contacts = 0
+        grain_wall_contacts = 0
+        if len(grain_pos):
+            grain_vel += (
+                np.asarray(sph_cfg.gravity)[None, :] + grain_hydro_acc
+            ) * dt
+            grain_pos += grain_vel * dt
+            grain_pair_contacts = resolve_grain_contacts(
+                grain_pos, grain_vel, grain_omega, grain_radii, grain_masses,
+                grain_inertia, grain_friction, grain_restitution, grain_rolling,
+                iterations=settings.granular_iterations,
+            )
+            if settings.enable_collision and colliders:
+                (grain_wall_contacts, grain_linear_impulses,
+                 grain_angular_impulses) = resolve_collisions(
+                    grain_pos, grain_vel, colliders,
+                    particle_radius=grain_radii,
+                    restitution=grain_restitution,
+                    friction_coefficient=grain_friction,
+                    iterations=settings.collision_iterations,
+                    collider_translations=motion_next,
+                    collider_velocities=collider_velocities,
+                    collider_rotations=collider_rotations,
+                    collider_centers=collider_centers,
+                    collider_angular_velocities=collider_angular_velocities,
+                    particle_mass=grain_masses,
+                    particle_angular_velocities=grain_omega,
+                    particle_inertia=grain_inertia,
+                    particle_rolling_friction=grain_rolling,
+                    return_body_impulses=True,
+                )
+                for path, impulse in grain_linear_impulses.items():
+                    linear_impulses[path] = linear_impulses.get(path, np.zeros(3)) + impulse
+                for path, impulse in grain_angular_impulses.items():
+                    angular_impulses[path] = angular_impulses.get(path, np.zeros(3)) + impulse
+            total_contacts += grain_pair_contacts + grain_wall_contacts
 
         # The axle removes translation and all off-axis rotation. Pressure
         # supplies torque over dt; collision response supplies an impulse.
@@ -658,12 +786,22 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
                 for key in ("shell", "band", "support_hG"):
                     fs_state[key] = fs_state[key][keep]
                 n = len(pos)
+            grain_keep = _sink_keep_mask(grain_pos, scene.sinks)
+            if not np.all(grain_keep):
+                grain_pos, grain_vel = grain_pos[grain_keep], grain_vel[grain_keep]
+                grain_omega, grain_radii = grain_omega[grain_keep], grain_radii[grain_keep]
+                grain_masses, grain_inertia = grain_masses[grain_keep], grain_inertia[grain_keep]
+                grain_friction = grain_friction[grain_keep]
+                grain_restitution = grain_restitution[grain_keep]
+                grain_rolling, grain_ids = grain_rolling[grain_keep], grain_ids[grain_keep]
 
         t += dt
         step += 1
 
         if not (np.all(np.isfinite(pos)) and np.all(np.isfinite(vel)) and np.all(np.isfinite(rho))):
             raise RuntimeError("Non-finite solver state.")
+        if not (np.all(np.isfinite(grain_pos)) and np.all(np.isfinite(grain_vel))):
+            raise RuntimeError("Non-finite granular state.")
         if n and (rho.min() < 0.5 * sph_cfg.rho0 or rho.max() > 1.5 * sph_cfg.rho0):
             raise RuntimeError(f"Density instability: {rho.min():.1f} .. {rho.max():.1f} kg/m3")
 
@@ -702,6 +840,16 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
                 f"| band={np.count_nonzero(fs_state['band'])} | detached={np.count_nonzero(detached)} "
                 f"| comps={current_ncomp} main={current_main_size} | contacts={contacts}" + kin_text
             )
+            if grain_sources:
+                grain_vmax = (
+                    float(np.linalg.norm(grain_vel, axis=1).max())
+                    if len(grain_vel) else 0.0
+                )
+                print(
+                    f"    grains={len(grain_pos)} vmax={grain_vmax:.3f} "
+                    f"fluidPairs={fluid_grain_pairs} contacts="
+                    f"{grain_pair_contacts + grain_wall_contacts}"
+                )
             for path, state in hinge_states.items():
                 print(
                     f"    axle {Path(path).name}: angle={np.degrees(state['angle']):+.2f}deg "
@@ -712,6 +860,7 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
     if frame_times[-1] < t - 1e-12:
         snapshot(t, fs_state, detached)
 
+    grain_capacity = max((len(frame) for frame in frame_grain_positions), default=0)
     arrays = dict(
         positions=_pad_frames(frame_positions, capacity, (3,)),
         velocity=_pad_frames(frame_velocity, capacity, (3,)),
@@ -743,6 +892,18 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
         body_rotations=np.asarray([
             frame_body_rotations[path] for path in body_paths
         ], dtype=np.float64),
+        granular_positions=_pad_frames(
+            frame_grain_positions, grain_capacity, (3,)
+        ),
+        granular_velocity=_pad_frames(
+            frame_grain_velocities, grain_capacity, (3,)
+        ),
+        granular_active_ids=_pad_frames(
+            frame_grain_ids, grain_capacity, dtype=np.int32, fill=-1
+        ),
+        granular_active_counts=np.asarray([
+            len(frame) for frame in frame_grain_positions
+        ], dtype=np.int32),
     )
     print("\nWriting outputs...")
     save_npz(npz_output, **arrays)
@@ -766,6 +927,13 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
             }
             for path in body_paths
         },
+        extra_particle_sets=([{
+            "prim_path": "/GraSPH_GranularResult",
+            "result_kind": "granular",
+            "frames": frame_grain_positions,
+            "velocities": frame_grain_velocities,
+            "widths": [2.0 * values for values in frame_grain_radii],
+        }] if grain_sources else None),
     )
 
     elapsed = time.perf_counter() - start

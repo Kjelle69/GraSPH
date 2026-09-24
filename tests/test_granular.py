@@ -32,6 +32,47 @@ def _cube(stage, path, lo, hi, role):
 
 
 class GranularTests(unittest.TestCase):
+    def test_mixed_fluid_granular_writes_both_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source_file = Path(directory) / "mixed.usda"
+            stage = Usd.Stage.CreateNew(str(source_file))
+            UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+            UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+            _cube(
+                stage, "/Fluid", (-0.05, -0.05, 0.0),
+                (0.05, 0.05, 0.10), "fluid",
+            )
+            grains = _cube(
+                stage, "/Grains", (-0.04, -0.04, 0.12),
+                (0.04, 0.04, 0.20), "granular_source",
+            )
+            grains.CreateAttribute(
+                "grasph:particleRadius", Sdf.ValueTypeNames.Double
+            ).Set(0.02)
+            grains.CreateAttribute(
+                "grasph:density", Sdf.ValueTypeNames.Double
+            ).Set(1600.0)
+            stage.GetRootLayer().Save()
+
+            result = run_simulation(
+                source_file, sph_cfg=SPHConfig(dp=0.05),
+                settings=SolverSettings(
+                    sim_time=0.01, output_fps=100.0, output_dir=directory,
+                    output_stem="mixed_result", report_interval=100.0,
+                ),
+            )
+            output = Usd.Stage.Open(result.usd_file)
+            fluid = output.GetPrimAtPath("/GraSPH_Result")
+            granular = output.GetPrimAtPath("/GraSPH_GranularResult")
+            self.assertTrue(fluid.IsValid())
+            self.assertTrue(granular.IsValid())
+            self.assertEqual(
+                granular.GetAttribute("grasph:resultKind").Get(), "granular"
+            )
+            self.assertGreater(
+                len(UsdGeom.Points(granular).GetPointsAttr().GetTimeSamples()), 1
+            )
+
     def test_fluid_dynamic_body_coupling_is_optional(self):
         with tempfile.TemporaryDirectory() as directory:
             source_file = Path(directory) / "fluid_body.usda"

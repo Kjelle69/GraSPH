@@ -22,7 +22,7 @@ bpy.context.scene.grasph_scene.project_root = ""
 assert Path(addon._surface_module(bpy.context.scene).__file__).resolve() == (
     root / "blender" / "grasph_surface.py"
 ).resolve()
-assert addon.ADDON_VERSION == (0, 6, 0)
+assert addon.ADDON_VERSION == (0, 7, 0)
 
 bpy.ops.object.select_all(action="SELECT")
 bpy.ops.object.delete(use_global=False)
@@ -106,6 +106,7 @@ grains.grasph.granular_initial_velocity = (0.0, 1.5, -0.25)
 grains.grasph.granular_start_time = 0.2
 grains.grasph.granular_end_time = 0.8
 cube("Granular Tank Test", "STATIC", (0.0, 0.0, 0.0))
+cube("Mixed Fluid Test", "FLUID", (-0.5, 0.0, 0.5))
 dynamic = cube("Dynamic Body Test", "DYNAMIC_BODY", (0.5, 0.0, 0.5))
 dynamic.grasph.body_mass = 2.5
 dynamic.grasph.body_inertia = (0.2, 0.3, 0.4)
@@ -114,6 +115,7 @@ dynamic.grasph.body_collision_shape = "CONVEX"
 dynamic.grasph.body_collision_margin = 0.004
 errors, warnings = addon.validate_scene(bpy.context.scene)
 assert not errors, errors
+assert any("Mixed fluid/granular" in warning for warning in warnings), warnings
 granular_output = root / "output" / "blender_granular_smoke.usdc"
 addon.export_scene(bpy.context, granular_output)
 granular_stage = Usd.Stage.Open(str(granular_output))

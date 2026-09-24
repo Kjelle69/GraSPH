@@ -8,7 +8,8 @@ def write_usd_animation(stage, frames, frame_times, fps, dp, output_file,
                         source_start_time_code=None, source_tps=None,
                         hinge_frames=None, frame_velocities=None,
                         prim_path="/GraSPH_Result", particle_widths=None,
-                        result_kind="fluid", body_frames=None):
+                        result_kind="fluid", body_frames=None,
+                        extra_particle_sets=None):
     """Write GraSPH Points as a USD overlay on the original source scene.
 
     v0.54 FIX2 deliberately does *not* flatten/copy the source scene. Instead
@@ -85,6 +86,39 @@ def write_usd_animation(stage, frames, frame_times, fps, dp, output_file,
                 Gf.Vec3f(float(v[0]), float(v[1]), float(v[2])) for v in velocities
             ]
             velocities_attr.Set(usd_velocities, tc)
+
+    for particle_set in (extra_particle_sets or []):
+        extra = UsdGeom.Points.Define(result_stage, particle_set["prim_path"])
+        extra.GetPrim().CreateAttribute(
+            "grasph:resultKind", Sdf.ValueTypeNames.String
+        ).Set(str(particle_set.get("result_kind", "particles")))
+        extra_points = extra.CreatePointsAttr()
+        extra_widths = extra.CreateWidthsAttr()
+        extra_velocities = (
+            extra.CreateVelocitiesAttr()
+            if particle_set.get("velocities") is not None else None
+        )
+        widths_data = particle_set.get("widths", 1.0)
+        for frame_index, (tc, positions) in enumerate(
+            zip(usd_times, particle_set["frames"])
+        ):
+            extra_points.Set([
+                Gf.Vec3f(float(p[0]), float(p[1]), float(p[2]))
+                for p in positions
+            ], tc)
+            widths = (
+                widths_data[frame_index]
+                if isinstance(widths_data, (list, tuple)) else widths_data
+            )
+            widths = np.asarray(widths, dtype=np.float64)
+            if widths.ndim == 0:
+                widths = np.full(len(positions), float(widths))
+            extra_widths.Set([float(value) for value in widths[:len(positions)]], tc)
+            if extra_velocities is not None:
+                extra_velocities.Set([
+                    Gf.Vec3f(float(v[0]), float(v[1]), float(v[2]))
+                    for v in particle_set["velocities"][frame_index]
+                ], tc)
 
     # Overlay the simulated axle rotation on the Blender-authored rotateXYZ
     # operation. The source layer still owns translation, scale, materials and

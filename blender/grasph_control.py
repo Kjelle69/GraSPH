@@ -5,7 +5,7 @@ The numerical solver is launched as a separate process; Blender remains the
 scene editor and result viewer.
 """
 
-ADDON_VERSION = (0, 6, 0)
+ADDON_VERSION = (0, 7, 0)
 
 
 bl_info = {
@@ -248,12 +248,9 @@ def validate_scene(scene):
     if not fluid_objects and not granular_objects:
         errors.append("No Fluid Volume or Granular Source is assigned.")
     if fluid_objects and granular_objects:
-        fluid_names = ", ".join(obj.name for obj in fluid_objects)
-        granular_names = ", ".join(obj.name for obj in granular_objects)
-        errors.append(
-            "Mixed sources are not available yet. Set Fluid Volume object(s) "
-            f"[{fluid_names}] to Unassigned, or Granular Source object(s) "
-            f"[{granular_names}] to Unassigned."
+        warnings.append(
+            "Mixed fluid/granular mode enabled: grains use buoyancy and drag "
+            "with equal-and-opposite reaction on the SPH fluid."
         )
     dynamic_bodies = [obj for obj in tagged if obj.grasph.role == "DYNAMIC_BODY"]
     if fluid_objects and dynamic_bodies and not scene.grasph_scene.enable_solid_coupling:

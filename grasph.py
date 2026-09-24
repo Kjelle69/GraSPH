@@ -6,7 +6,7 @@ from grasph_scene import load_scene
 
 
 def main():
-    p = argparse.ArgumentParser(description="GraSPH: USD kinematics, dynamic hinges, and WCSPH")
+    p = argparse.ArgumentParser(description="GraSPH: coupled WCSPH, granular DEM/PBD, and USD rigid bodies")
     p.add_argument("usd", help="Input .usd/.usda/.usdc scene")
     p.add_argument("--time", type=float, default=0.50, help="Simulation time [s]")
     p.add_argument("--dp", type=float, default=0.020, help="Particle spacing [m]")
