@@ -5,7 +5,7 @@ The numerical solver is launched as a separate process; Blender remains the
 scene editor and result viewer.
 """
 
-ADDON_VERSION = (0, 7, 3)
+ADDON_VERSION = (0, 7, 4)
 
 
 bl_info = {
@@ -1188,7 +1188,7 @@ class GRASPH_PT_display(Panel):
         if modifier is None:
             layout.label(text="No GraSPH surface in scene", icon="INFO")
             return
-        layout.label(text=f"Surface: {surface.name}", icon="MOD_NODES")
+        layout.label(text=f"Surface: {surface.name}", icon="GEOMETRY_NODES")
         active_version = modifier.node_group.get("grasph_surface_version", "")
         if active_version:
             layout.label(text=f"Surface v{active_version} (active)", icon="CHECKMARK")

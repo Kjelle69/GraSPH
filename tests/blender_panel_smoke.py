@@ -22,7 +22,9 @@ bpy.context.scene.grasph_scene.project_root = ""
 assert Path(addon._surface_module(bpy.context.scene).__file__).resolve() == (
     root / "blender" / "grasph_surface.py"
 ).resolve()
-assert addon.ADDON_VERSION == (0, 7, 3)
+assert addon.ADDON_VERSION == (0, 7, 4)
+label_icons = bpy.types.UILayout.bl_rna.functions["label"].parameters["icon"].enum_items
+assert "GEOMETRY_NODES" in label_icons
 
 bpy.ops.object.select_all(action="SELECT")
 bpy.ops.object.delete(use_global=False)
