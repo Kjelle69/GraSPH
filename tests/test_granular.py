@@ -38,7 +38,7 @@ class GranularTests(unittest.TestCase):
             stage = Usd.Stage.CreateNew(str(source_file))
             UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
             UsdGeom.SetStageMetersPerUnit(stage, 1.0)
-            _cube(stage, "/Fluid", (0.35, -0.05, 0.05), (0.45, 0.05, 0.15), "fluid")
+            _cube(stage, "/Fluid", (0.34, -0.06, 0.04), (0.46, 0.06, 0.16), "fluid")
             grains = _cube(
                 stage, "/Grain", (-0.006, -0.006, 0.194),
                 (0.006, 0.006, 0.206), "granular_source",

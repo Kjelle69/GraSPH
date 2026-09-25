@@ -260,6 +260,42 @@ class DistanceFieldCollider:
         normal[ids] = grad
         return distance, normal
 
+    def query_exact(self, positions):
+        """Return closest-triangle distance and normal for a small point set.
+
+        The cached field is intentionally coarse for speed, but interpolation
+        can blend normals from opposite sides of thin meshes.  Contact points
+        are few enough that an exact refinement is both cheap and much safer.
+        """
+        positions = np.asarray(positions, dtype=np.float64)
+        distance2 = np.full(len(positions), np.inf, dtype=np.float64)
+        delta_best = np.zeros((len(positions), 3), dtype=np.float64)
+        face_best = np.zeros((len(positions), 3), dtype=np.float64)
+
+        for triangle in self.triangles:
+            a, b, c = triangle
+            closest = closest_point_triangle_batch(positions, a, b, c)
+            delta = positions - closest
+            candidate_distance2 = np.einsum("ij,ij->i", delta, delta)
+            better = candidate_distance2 < distance2
+            if not np.any(better):
+                continue
+            distance2[better] = candidate_distance2[better]
+            delta_best[better] = delta[better]
+            face_normal = np.cross(b - a, c - a)
+            length = np.linalg.norm(face_normal)
+            if length > 1.0e-15:
+                face_normal = face_normal / length
+            else:
+                face_normal = np.array((0.0, 0.0, 1.0))
+            face_best[better] = face_normal
+
+        distance = np.sqrt(np.maximum(distance2, 0.0))
+        normal = face_best
+        separated = distance > 1.0e-12
+        normal[separated] = delta_best[separated] / distance[separated, None]
+        return distance, normal
+
 
 def build_colliders(scene, voxel_size=0.010, margin=0.040):
     colliders = []
@@ -305,6 +341,7 @@ def resolve_collisions(
     particle_angular_velocities=None,
     particle_inertia=None,
     particle_rolling_friction=None,
+    previous_positions=None,
     return_angular_impulses=False,
     return_body_impulses=False,
 ):
@@ -352,7 +389,12 @@ def resolve_collisions(
         else np.asarray(particle_rolling_friction, dtype=np.float64)
     )
 
-    for _ in range(iterations):
+    previous_positions = (
+        None if previous_positions is None
+        else np.asarray(previous_positions, dtype=np.float64)
+    )
+
+    for iteration in range(iterations):
         for collider in colliders:
             translation = np.asarray(
                 collider_translations.get(collider.name, (0.0, 0.0, 0.0)),
@@ -376,7 +418,55 @@ def resolve_collisions(
             relative = pos - translation[None, :] - center[None, :]
             query_pos = center[None, :] + relative @ rotation
             distance, normal_local = collider.query(query_pos)
+            can_refine = (
+                previous_positions is not None
+                and hasattr(collider, "query_exact")
+            )
+            refinement_radius = radii + float(getattr(collider, "voxel_size", 0.0))
+            refine = can_refine & (distance < refinement_radius)
+            if np.any(refine):
+                exact_distance, exact_normal = collider.query_exact(query_pos[refine])
+                distance[refine] = exact_distance
+                normal_local[refine] = exact_normal
             normal = normal_local @ rotation.T
+            if previous_positions is not None and iteration == 0:
+                previous_relative = (
+                    previous_positions - translation[None, :] - center[None, :]
+                )
+                previous_query = center[None, :] + previous_relative @ rotation
+                previous_distance, previous_normal_local = collider.query(previous_query)
+                previous_refine = can_refine & (previous_distance < refinement_radius)
+                if np.any(previous_refine):
+                    exact_distance, exact_normal = collider.query_exact(
+                        previous_query[previous_refine]
+                    )
+                    previous_distance[previous_refine] = exact_distance
+                    previous_normal_local[previous_refine] = exact_normal
+                previous_normal = previous_normal_local @ rotation.T
+                travel = pos - previous_positions
+                normal_travel = np.einsum(
+                    "ij,ij->i", travel, previous_normal
+                )
+                projected_distance = previous_distance - np.abs(normal_travel)
+                previous_normal_length = np.linalg.norm(previous_normal, axis=1)
+                swept = (
+                    (previous_distance >= radii)
+                    & (projected_distance < radii)
+                    & (previous_normal_length > 0.5)
+                )
+                if np.any(swept):
+                    # Unsigned fields do not guarantee which side their
+                    # interpolated gradient points toward. At a swept entry,
+                    # the separating normal must oppose the crossing motion.
+                    wrong_way = np.einsum(
+                        "ij,ij->i", travel, previous_normal
+                    ) > 0.0
+                    previous_normal = previous_normal.copy()
+                    previous_normal[wrong_way] *= -1.0
+                    distance = distance.copy()
+                    normal = normal.copy()
+                    distance[swept] = projected_distance[swept]
+                    normal[swept] = previous_normal[swept]
             contact = distance < radii
 
             if not np.any(contact):

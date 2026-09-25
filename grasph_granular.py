@@ -375,6 +375,7 @@ def run_granular_simulation(usd_file, scene, settings, gravity=(0.0, 0.0, -9.81)
                 )
                 flow["emitted"] += len(new_pos)
 
+        previous_pos = pos.copy()
         velocity += gravity[None, :] * dt
         pos += velocity * dt
         pair_contacts = resolve_grain_contacts(
@@ -400,6 +401,7 @@ def run_granular_simulation(usd_file, scene, settings, gravity=(0.0, 0.0, -9.81)
                 particle_angular_velocities=angular_velocity,
                 particle_inertia=inertia,
                 particle_rolling_friction=rolling_friction,
+                previous_positions=previous_pos,
                 return_angular_impulses=True,
                 return_body_impulses=True,
             )

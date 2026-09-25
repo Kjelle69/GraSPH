@@ -5,7 +5,7 @@ The numerical solver is launched as a separate process; Blender remains the
 scene editor and result viewer.
 """
 
-ADDON_VERSION = (0, 7, 1)
+ADDON_VERSION = (0, 7, 2)
 
 
 bl_info = {
@@ -265,6 +265,22 @@ def validate_scene(scene):
                 f"Mixed scene has only about {fluid_estimate} fluid particles at "
                 f"spacing {dp:g} m; reduce Particle Spacing for stable coupling."
             )
+        grain_estimate = 0
+        for obj in granular_objects:
+            radius = float(obj.grasph.granular_radius)
+            if obj.grasph.granular_source_mode != "VOLUME" or radius <= 0.0:
+                continue
+            diameter = 2.0 * radius
+            grain_estimate += (
+                max(0, int(float(obj.dimensions[0]) * unit_scale / diameter))
+                * max(0, int(float(obj.dimensions[1]) * unit_scale / diameter))
+                * max(0, int(float(obj.dimensions[2]) * unit_scale / diameter))
+            )
+        if grain_estimate > 10000:
+            warnings.append(
+                f"Granular volumes create about {grain_estimate:,} grains; "
+                "increase Granular Radius for a faster first test."
+            )
         smallest_radius = min(
             obj.grasph.granular_radius for obj in granular_objects
         )
@@ -301,6 +317,11 @@ def validate_scene(scene):
                 errors.append(f"{obj.name}: granular radius must be positive.")
             if settings.granular_density <= 0.0:
                 errors.append(f"{obj.name}: granular density must be positive.")
+            if settings.granular_restitution > 0.5:
+                warnings.append(
+                    f"{obj.name}: restitution {settings.granular_restitution:g} "
+                    "is highly energetic in a dense granular volume."
+                )
             if settings.granular_source_mode == "FLOW":
                 if settings.granular_flow_rate <= 0.0:
                     errors.append(f"{obj.name}: granular flow rate must be positive.")
