@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from pxr import Usd, UsdGeom, Gf
+from pxr import Usd, UsdGeom, UsdPhysics, UsdShade, Gf
 
 
 @dataclass
@@ -205,6 +205,15 @@ def _inherited_attribute(prim, name):
     return None, None
 
 
+def _nearest_api_ancestor(prim, schema):
+    current = prim
+    while current and current.IsValid():
+        if current.HasAPI(schema):
+            return current
+        current = current.GetParent()
+    return None
+
+
 def _float_attribute(prim, name, default):
     value, _ = _inherited_attribute(prim, name)
     return float(default if value is None else value)
@@ -218,6 +227,24 @@ def _string_attribute(prim, name, default):
 def _vec3_attribute(prim, name, default):
     value, _ = _inherited_attribute(prim, name)
     return np.asarray(default if value is None else value, dtype=np.float64)
+
+
+def _physics_material_values(prim):
+    try:
+        material, _ = UsdShade.MaterialBindingAPI(prim).ComputeBoundMaterial("physics")
+        if not material or not material.GetPrim().IsValid():
+            return None
+        api = UsdPhysics.MaterialAPI(material.GetPrim())
+        friction = api.GetDynamicFrictionAttr().Get()
+        if friction is None:
+            friction = api.GetStaticFrictionAttr().Get()
+        restitution = api.GetRestitutionAttr().Get()
+        density = api.GetDensityAttr().Get()
+        return {
+            "friction": friction, "restitution": restitution, "density": density,
+        }
+    except Exception:
+        return None
 
 
 def _hinge_for_prim(prim):
@@ -268,10 +295,69 @@ def _hinge_for_prim(prim):
     )
 
 
+def _physics_hinge_owners(stage):
+    """Collect world-attached standard revolute joints by rigid-body path."""
+    result = {}
+    axes = {
+        "X": np.array((1.0, 0.0, 0.0)),
+        "Y": np.array((0.0, 1.0, 0.0)),
+        "Z": np.array((0.0, 0.0, 1.0)),
+    }
+    for prim in stage.Traverse():
+        if not prim.IsA(UsdPhysics.RevoluteJoint):
+            continue
+        joint = UsdPhysics.RevoluteJoint(prim)
+        body0 = joint.GetBody0Rel().GetTargets()
+        body1 = joint.GetBody1Rel().GetTargets()
+        # GraSPH's current hinge model is attached to the world. Two-body
+        # joints remain valid USD but require a future compound-body solver.
+        if bool(body0) == bool(body1):
+            continue
+        body_path = body1[0] if body1 else body0[0]
+        position_attr = joint.GetLocalPos0Attr() if body1 else joint.GetLocalPos1Attr()
+        center = position_attr.Get() or Gf.Vec3f(0.0)
+        axis = axes.get(str(joint.GetAxisAttr().Get() or "X").upper())
+        if axis is None:
+            continue
+        owner = stage.GetPrimAtPath(body_path)
+        mass_api = UsdPhysics.MassAPI(owner)
+        diagonal = mass_api.GetDiagonalInertiaAttr().Get()
+        axis_index = int(np.argmax(np.abs(axis)))
+        inertia = float(diagonal[axis_index]) if diagonal is not None else 0.002
+        result[str(body_path)] = {
+            "axis": axis,
+            "center": np.asarray(center, dtype=np.float64),
+            "inertia": max(inertia, 1.0e-9),
+        }
+    return result
+
+
+def _physics_hinge_for_prim(prim, owners):
+    current = prim
+    while current and current.IsValid():
+        data = owners.get(str(current.GetPath()))
+        if data is not None:
+            return HingeData(
+                path=str(prim.GetPath()), driver_path=str(current.GetPath()),
+                axis=data["axis"].copy(), center=data["center"].copy(),
+                moment_of_inertia=data["inertia"], angular_damping=0.002,
+                max_angular_speed=40.0,
+            )
+        current = current.GetParent()
+    return None
+
+
 def _dynamic_body_for_prim(prim, mesh_data):
     enabled, owner = _inherited_attribute(prim, "grasph:dynamicBodyEnabled")
+    physics_owner = None
     if not bool(enabled):
-        return None
+        physics_owner = _nearest_api_ancestor(prim, UsdPhysics.RigidBodyAPI)
+        if physics_owner is None:
+            return None
+        rigid = UsdPhysics.RigidBodyAPI(physics_owner)
+        if bool(rigid.GetKinematicEnabledAttr().Get() or False):
+            return None
+        owner = physics_owner
     center, _ = _inherited_attribute(prim, "grasph:bodyCenter")
     mass, _ = _inherited_attribute(prim, "grasph:mass")
     inertia, _ = _inherited_attribute(prim, "grasph:inertiaDiagonal")
@@ -280,6 +366,36 @@ def _dynamic_body_for_prim(prim, mesh_data):
     collision_radius, _ = _inherited_attribute(prim, "grasph:collisionRadius")
     collision_shape, _ = _inherited_attribute(prim, "grasph:collisionShape")
     collision_margin, _ = _inherited_attribute(prim, "grasph:collisionMargin")
+    if physics_owner is not None:
+        mass_api = UsdPhysics.MassAPI(physics_owner)
+        physics_mass = mass_api.GetMassAttr().Get()
+        physics_inertia = mass_api.GetDiagonalInertiaAttr().Get()
+        physics_center = mass_api.GetCenterOfMassAttr().Get()
+        size = np.maximum(mesh_data.bounds_max - mesh_data.bounds_min, 1.0e-6)
+        if mass is None:
+            mass = physics_mass
+        if mass is None or float(mass) <= 0.0:
+            mass = float(np.prod(size) * 1000.0)
+        if inertia is None:
+            inertia = physics_inertia
+        if inertia is None or np.any(np.asarray(inertia) <= 0.0):
+            inertia = (float(mass) / 12.0) * np.array((
+                size[1] ** 2 + size[2] ** 2,
+                size[0] ** 2 + size[2] ** 2,
+                size[0] ** 2 + size[1] ** 2,
+            ))
+        if center is None and physics_center is not None:
+            transform = UsdGeom.XformCache().GetLocalToWorldTransform(physics_owner)
+            world_center = transform.Transform(Gf.Vec3d(*map(float, physics_center)))
+            center = tuple(world_center)
+        if center is None:
+            center = 0.5 * (mesh_data.bounds_min + mesh_data.bounds_max)
+        mesh_collision = UsdPhysics.MeshCollisionAPI(prim)
+        approximation = mesh_collision.GetApproximationAttr().Get()
+        if collision_shape is None:
+            collision_shape = "sphere" if approximation == UsdPhysics.Tokens.boundingSphere else "convex"
+        if collision_radius is None:
+            collision_radius = 0.5 * float(np.max(size))
     mass = float(1.0 if mass is None else mass)
     inertia = np.asarray((0.1, 0.1, 0.1) if inertia is None else inertia, dtype=np.float64)
     if mass <= 0.0 or np.any(inertia <= 0.0):
@@ -456,6 +572,7 @@ def load_scene(usd_file):
     print()
     print("Scanning scene...")
     xcache = UsdGeom.XformCache(ref_time)
+    physics_hinge_owners = _physics_hinge_owners(stage)
     for prim in stage.Traverse():
         if not prim.IsA(UsdGeom.Mesh):
             continue
@@ -501,10 +618,20 @@ def load_scene(usd_file):
         else:
             colliders.append(data)
             label = "COLLIDER"
+            physics_material = _physics_material_values(prim) or {}
+            custom_friction, _ = _inherited_attribute(prim, "grasph:friction")
+            custom_restitution, _ = _inherited_attribute(prim, "grasph:restitution")
             collider_materials[data.path] = {
-                "friction": max(0.0, _float_attribute(prim, "grasph:friction", 0.45)),
+                "friction": max(0.0, float(
+                    custom_friction if custom_friction is not None
+                    else physics_material.get("friction")
+                    if physics_material.get("friction") is not None else 0.45
+                )),
                 "restitution": float(np.clip(
-                    _float_attribute(prim, "grasph:restitution", 0.10), 0.0, 1.0
+                    custom_restitution if custom_restitution is not None
+                    else physics_material.get("restitution")
+                    if physics_material.get("restitution") is not None else 0.10,
+                    0.0, 1.0
                 )),
                 "rolling_friction": max(
                     0.0, _float_attribute(prim, "grasph:rollingFriction", 0.02)
@@ -515,9 +642,11 @@ def load_scene(usd_file):
             reference_linear[data.path] = linear
             reference_translation[data.path] = translation
             hinge = _hinge_for_prim(prim)
+            if hinge is None:
+                hinge = _physics_hinge_for_prim(prim, physics_hinge_owners)
             if hinge is not None:
                 hinges[data.path] = hinge
-            body = _dynamic_body_for_prim(prim, data)
+            body = None if hinge is not None else _dynamic_body_for_prim(prim, data)
             if body is not None:
                 dynamic_bodies[data.path] = body
 

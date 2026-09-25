@@ -3,7 +3,7 @@ import importlib.util
 from pathlib import Path
 
 import bpy
-from pxr import Usd
+from pxr import Usd, UsdPhysics, UsdShade
 
 
 root = Path(__file__).resolve().parents[1]
@@ -22,7 +22,7 @@ bpy.context.scene.grasph_scene.project_root = ""
 assert Path(addon._surface_module(bpy.context.scene).__file__).resolve() == (
     root / "blender" / "grasph_surface.py"
 ).resolve()
-assert addon.ADDON_VERSION == (0, 8, 0)
+assert addon.ADDON_VERSION == (0, 9, 0)
 label_icons = bpy.types.UILayout.bl_rna.functions["label"].parameters["icon"].enum_items
 assert "GEOMETRY_NODES" in label_icons
 assert "FILE_FOLDER" in label_icons
@@ -102,6 +102,23 @@ assert hinge.GetAttribute("grasph:axis").Get() == "X"
 assert abs(hinge.GetAttribute("grasph:momentOfInertia").Get() - 0.125) < 1e-12
 assert abs(hinge.GetAttribute("grasph:friction").Get() - 0.33) < 1e-6
 assert abs(hinge.GetAttribute("grasph:rollingFriction").Get() - 0.015) < 1e-6
+physics_scenes = [prim for prim in stage.Traverse()
+                  if prim.IsA(UsdPhysics.Scene)]
+revolute_joints = [prim for prim in stage.Traverse()
+                   if prim.IsA(UsdPhysics.RevoluteJoint)]
+assert len(physics_scenes) == 1
+assert len(revolute_joints) == 1
+assert hinge.HasAPI(UsdPhysics.CollisionAPI)
+assert hinge.HasAPI(UsdPhysics.MeshCollisionAPI)
+hinge_material, _ = UsdShade.MaterialBindingAPI(hinge).ComputeBoundMaterial("physics")
+assert hinge_material.GetPrim().HasAPI(UsdPhysics.MaterialAPI)
+assert abs(UsdPhysics.MaterialAPI(hinge_material).GetDynamicFrictionAttr().Get() - 0.33) < 1e-6
+hinge_owner = hinge.GetParent()
+assert hinge_owner.HasAPI(UsdPhysics.RigidBodyAPI)
+assert hinge_owner.HasAPI(UsdPhysics.MassAPI)
+assert UsdPhysics.RevoluteJoint(revolute_joints[0]).GetBody1Rel().GetTargets() == [
+    hinge_owner.GetPath()
+]
 
 # Granular authoring is a separate, valid scene mode.
 bpy.ops.object.select_all(action="SELECT")
@@ -154,6 +171,16 @@ assert abs(dynamic_prim.GetAttribute("grasph:mass").Get() - 2.5) < 1e-6
 assert abs(dynamic_prim.GetAttribute("grasph:collisionRadius").Get() - 0.15) < 1e-6
 assert dynamic_prim.GetAttribute("grasph:collisionShape").Get() == "convex"
 assert abs(dynamic_prim.GetAttribute("grasph:collisionMargin").Get() - 0.004) < 1e-6
+dynamic_owner = dynamic_prim
+dynamic_mesh = next(
+    prim for prim in Usd.PrimRange(dynamic_owner)
+    if prim.HasAPI(UsdPhysics.CollisionAPI)
+)
+assert dynamic_mesh.HasAPI(UsdPhysics.CollisionAPI)
+assert dynamic_mesh.HasAPI(UsdPhysics.MeshCollisionAPI)
+assert dynamic_owner.HasAPI(UsdPhysics.RigidBodyAPI)
+assert dynamic_owner.HasAPI(UsdPhysics.MassAPI)
+assert abs(UsdPhysics.MassAPI(dynamic_owner).GetMassAttr().Get() - 2.5) < 1e-6
 
 # The result display instances renderable spheres on an animated point cloud.
 cloud_data = bpy.data.pointclouds.new("Granular Result Points")

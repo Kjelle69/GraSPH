@@ -5,7 +5,7 @@ The numerical solver is launched as a separate process; Blender remains the
 scene editor and result viewer.
 """
 
-ADDON_VERSION = (0, 8, 0)
+ADDON_VERSION = (0, 9, 0)
 
 
 bl_info = {
@@ -421,13 +421,109 @@ def _matching_xform(stage, object_name):
     return matches[0] if len(matches) == 1 else None
 
 
-def author_grasph_metadata(usd_path, objects):
+def _author_usd_physics(stage, objects, scene):
+    """Add portable rigid-body semantics without replacing GraSPH metadata."""
+    from mathutils import Vector
+    from pxr import Gf, Tf, Usd, UsdGeom, UsdPhysics, UsdShade
+
+    physics_root = stage.DefinePrim("/root/_GraSPHPhysics", "Scope")
+    physics_scene = UsdPhysics.Scene.Define(stage, physics_root.GetPath().AppendChild("Scene"))
+    gravity = scene.gravity
+    gravity_length = float(gravity.length)
+    if gravity_length > 1.0e-12:
+        direction = Gf.Vec3f(*(float(value) / gravity_length for value in gravity))
+        physics_scene.CreateGravityDirectionAttr(direction)
+        metres_per_unit = max(float(UsdGeom.GetStageMetersPerUnit(stage)), 1.0e-12)
+        physics_scene.CreateGravityMagnitudeAttr(gravity_length / metres_per_unit)
+    UsdPhysics.SetStageKilogramsPerUnit(stage, 1.0)
+    joints_root = stage.DefinePrim(physics_root.GetPath().AppendChild("Joints"), "Scope")
+    materials_root = stage.DefinePrim(
+        physics_root.GetPath().AppendChild("Materials"), "Scope"
+    )
+
+    for obj in objects:
+        settings = obj.grasph
+        if settings.role not in {"STATIC", "KINEMATIC", "DYNAMIC_HINGE", "DYNAMIC_BODY"}:
+            continue
+        owner = _matching_xform(stage, obj.name)
+        if owner is None:
+            continue
+        meshes = [prim for prim in Usd.PrimRange(owner) if prim.IsA(UsdGeom.Mesh)]
+        material_name = Tf.MakeValidIdentifier(obj.name + "_PhysicsMaterial")
+        material = UsdShade.Material.Define(
+            stage, materials_root.GetPath().AppendChild(material_name)
+        )
+        material_api = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
+        material_api.CreateStaticFrictionAttr(float(settings.collider_friction))
+        material_api.CreateDynamicFrictionAttr(float(settings.collider_friction))
+        material_api.CreateRestitutionAttr(float(settings.collider_restitution))
+        for mesh in meshes:
+            UsdPhysics.CollisionAPI.Apply(mesh).CreateCollisionEnabledAttr(True)
+            mesh_api = UsdPhysics.MeshCollisionAPI.Apply(mesh)
+            approximation = UsdPhysics.Tokens.none
+            if settings.role in {"DYNAMIC_HINGE", "DYNAMIC_BODY"}:
+                approximation = (
+                    UsdPhysics.Tokens.boundingSphere
+                    if settings.role == "DYNAMIC_BODY"
+                    and settings.body_collision_shape == "SPHERE"
+                    else UsdPhysics.Tokens.convexHull
+                )
+            mesh_api.CreateApproximationAttr(approximation)
+            UsdShade.MaterialBindingAPI.Apply(mesh).Bind(
+                material, UsdShade.Tokens.weakerThanDescendants, "physics"
+            )
+
+        if settings.role == "STATIC":
+            continue
+        rigid = UsdPhysics.RigidBodyAPI.Apply(owner)
+        rigid.CreateRigidBodyEnabledAttr(True)
+        rigid.CreateKinematicEnabledAttr(settings.role == "KINEMATIC")
+        if settings.role == "KINEMATIC":
+            continue
+
+        mass_api = UsdPhysics.MassAPI.Apply(owner)
+        center_world = _object_center(obj, settings)
+        center_local = obj.matrix_world.inverted() @ Vector(center_world)
+        mass_api.CreateCenterOfMassAttr(Gf.Vec3f(*map(float, center_local)))
+        if settings.role == "DYNAMIC_BODY":
+            mass_api.CreateMassAttr(float(settings.body_mass))
+            mass_api.CreateDiagonalInertiaAttr(
+                Gf.Vec3f(*map(float, settings.body_inertia))
+            )
+            continue
+
+        # GraSPH's hinge currently exposes only the inertia around its free
+        # axis. A spherical tensor is the least surprising portable fallback;
+        # the exact scalar remains authored as grasph:momentOfInertia.
+        inertia = float(settings.moment_of_inertia)
+        mass_api.CreateDiagonalInertiaAttr(Gf.Vec3f(inertia, inertia, inertia))
+        joint_name = Tf.MakeValidIdentifier(obj.name + "_RevoluteJoint")
+        joint = UsdPhysics.RevoluteJoint.Define(
+            stage, joints_root.GetPath().AppendChild(joint_name)
+        )
+        joint.CreateBody1Rel().SetTargets([owner.GetPath()])
+        joint.CreateAxisAttr(getattr(UsdPhysics.Tokens, settings.axis.lower()))
+        joint.CreateLocalPos0Attr(Gf.Vec3f(*map(float, center_world)))
+        joint.CreateLocalPos1Attr(Gf.Vec3f(*map(float, center_local)))
+        joint.CreateLocalRot0Attr(Gf.Quatf(1.0))
+        rotation = obj.matrix_world.to_quaternion().inverted()
+        joint.CreateLocalRot1Attr(Gf.Quatf(
+            float(rotation.w),
+            Gf.Vec3f(float(rotation.x), float(rotation.y), float(rotation.z)),
+        ))
+        joint.CreateCollisionEnabledAttr(False)
+
+
+def author_grasph_metadata(usd_path, objects, scene=None):
     """Write simulation semantics into the exported USD layer."""
     from pxr import Gf, Sdf, Usd, UsdGeom
 
     stage = Usd.Stage.Open(str(usd_path))
     if stage is None:
         raise RuntimeError(f"Could not reopen exported USD: {usd_path}")
+
+    if scene is not None and scene.grasph_scene.author_usd_physics:
+        _author_usd_physics(stage, objects, scene)
 
     for obj in objects:
         settings = obj.grasph
@@ -567,7 +663,7 @@ def export_scene(context, filepath):
                 obj.select_set(True)
         if active_before is not None and active_before.name in context.scene.objects:
             context.view_layer.objects.active = active_before
-    author_grasph_metadata(filepath, tagged)
+    author_grasph_metadata(filepath, tagged, context.scene)
 
 
 class GraSPHObjectSettings(PropertyGroup):
@@ -705,6 +801,14 @@ class GraSPHSceneSettings(PropertyGroup):
         name="Last Input USD", subtype="FILE_PATH", options={"SKIP_SAVE"},
     )
     auto_export: BoolProperty(name="Export Before Run", default=True)
+    author_usd_physics: BoolProperty(
+        name="Author USD Physics",
+        default=True,
+        description=(
+            "Add portable PhysicsScene, collider, rigid-body, mass and joint schemas "
+            "alongside GraSPH metadata"
+        ),
+    )
     free_surface: EnumProperty(
         name="Free Surface",
         items=(("anchored_band", "Anchored Band", "Atmospheric free-surface model"),
@@ -1265,6 +1369,9 @@ class GRASPH_PT_simulation(Panel):
 
         layout.prop(settings, "project_root")
         layout.prop(settings, "auto_export")
+        layout.prop(settings, "author_usd_physics")
+        if settings.author_usd_physics:
+            layout.label(text="USD Physics schemas will be authored", icon="CHECKMARK")
         source_row = layout.row()
         source_row.enabled = not settings.auto_export
         source_row.prop(settings, "usd_file")

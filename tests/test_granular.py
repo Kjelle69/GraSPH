@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
-from pxr import Gf, Sdf, Usd, UsdGeom
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 
 from grasph_scene import load_scene, generate_granular_particles
 from grasph_solver import SolverSettings, run_simulation
@@ -32,6 +32,60 @@ def _cube(stage, path, lo, hi, role):
 
 
 class GranularTests(unittest.TestCase):
+    def test_standard_usd_physics_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source_file = Path(directory) / "standard_physics.usda"
+            stage = Usd.Stage.CreateNew(str(source_file))
+            UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+            UsdPhysics.Scene.Define(stage, "/PhysicsScene")
+
+            hinged_owner = UsdGeom.Xform.Define(stage, "/Hinged").GetPrim()
+            hinged_mesh = _cube(
+                stage, "/Hinged/Geom", (-0.1, -0.1, 0.4),
+                (0.1, 0.1, 0.6), "collider",
+            )
+            hinged_mesh.RemoveProperty("grasph:role")
+            UsdPhysics.RigidBodyAPI.Apply(hinged_owner)
+            UsdPhysics.CollisionAPI.Apply(hinged_mesh)
+            hinge_mass = UsdPhysics.MassAPI.Apply(hinged_owner)
+            hinge_mass.CreateDiagonalInertiaAttr(Gf.Vec3f(0.2, 0.3, 0.4))
+            joint = UsdPhysics.RevoluteJoint.Define(stage, "/HingeJoint")
+            joint.CreateBody1Rel().SetTargets([hinged_owner.GetPath()])
+            joint.CreateAxisAttr(UsdPhysics.Tokens.y)
+            joint.CreateLocalPos0Attr(Gf.Vec3f(0.0, 0.0, 0.5))
+
+            free_owner = UsdGeom.Xform.Define(stage, "/Free").GetPrim()
+            free_mesh = _cube(
+                stage, "/Free/Geom", (0.4, -0.1, 0.4),
+                (0.6, 0.1, 0.6), "collider",
+            )
+            free_mesh.RemoveProperty("grasph:role")
+            UsdPhysics.RigidBodyAPI.Apply(free_owner)
+            UsdPhysics.CollisionAPI.Apply(free_mesh)
+            free_mass = UsdPhysics.MassAPI.Apply(free_owner)
+            free_mass.CreateMassAttr(2.0)
+            free_mass.CreateDiagonalInertiaAttr(Gf.Vec3f(0.1, 0.2, 0.3))
+            material = UsdShade.Material.Define(stage, "/PhysicsMaterial")
+            material_api = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
+            material_api.CreateDynamicFrictionAttr(0.72)
+            material_api.CreateRestitutionAttr(0.18)
+            UsdShade.MaterialBindingAPI.Apply(free_mesh).Bind(
+                material, UsdShade.Tokens.weakerThanDescendants, "physics"
+            )
+            stage.GetRootLayer().Save()
+
+            scene = load_scene(source_file)
+            self.assertEqual(len(scene.hinges), 1)
+            self.assertEqual(len(scene.dynamic_bodies), 1)
+            hinge = next(iter(scene.hinges.values()))
+            body = next(iter(scene.dynamic_bodies.values()))
+            np.testing.assert_allclose(hinge.axis, (0.0, 1.0, 0.0))
+            self.assertAlmostEqual(hinge.moment_of_inertia, 0.3)
+            self.assertAlmostEqual(body.mass, 2.0)
+            np.testing.assert_allclose(body.inertia, (0.1, 0.2, 0.3))
+            self.assertAlmostEqual(scene.collider_materials["/Free/Geom"]["friction"], 0.72)
+            self.assertAlmostEqual(scene.collider_materials["/Free/Geom"]["restitution"], 0.18)
+
     def test_small_mixed_grain_does_not_tunnel_through_coarse_collider(self):
         with tempfile.TemporaryDirectory() as directory:
             source_file = Path(directory) / "mixed_floor.usda"

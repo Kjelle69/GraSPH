@@ -1,4 +1,4 @@
-# GraSPH fluid/granular coupling (Blender controls v0.8.0)
+# GraSPH fluid/granular coupling (Blender controls v0.9.0)
 
 Fluid Volume and Granular Source may now be used in the same scene. Spherical
 grains sample the local SPH velocity and density, receive buoyancy and
@@ -16,6 +16,10 @@ v0.7.4 fixes Fluid Display drawing under Blender 5's icon identifiers.
 v0.8.0 adds live scene workload estimates, quality and granular-material
 presets, clearer physics/display sections, timestep guidance and output-folder
 access from Blender.
+v0.9.0 begins the portable USD Physics layer. Blender exports PhysicsScene,
+CollisionAPI, MeshCollisionAPI, RigidBodyAPI, MassAPI, PhysicsMaterialAPI and
+RevoluteJoint schemas alongside the backward-compatible `grasph:*` solver
+metadata. The loader can also use those standard schemas as a fallback.
 
 Dynamic Body now supports a sampled convex mesh collider instead of requiring
 a spherical envelope. In Blender choose `Dynamic Body` and `Convex Mesh`; the
