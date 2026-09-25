@@ -17,7 +17,7 @@ class FluidGranularCouplingTests(unittest.TestCase):
             np.asarray([[0.01, 0.0, 0.0]]),
             np.asarray([[0.0, 0.0, 0.0]]),
             grain_radius, grain_mass,
-            np.asarray([0.0, 0.0, -9.81]), 0.1,
+            np.asarray([0.0, 0.0, -9.81]), 0.1, dt=0.001,
         )
         self.assertEqual(pairs, 1)
         total = fluid_mass * fluid_acc[0] + grain_mass[0] * grain_acc[0]

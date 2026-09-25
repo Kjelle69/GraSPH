@@ -307,6 +307,15 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
         voxel_size=0.5 * sph_cfg.dp,
         margin=2.0 * sph_cfg.dp,
     ) if scene.colliders else []
+    grain_collider_skin = (
+        0.55 * max(float(collider.voxel_size) for collider in colliders)
+        if colliders else 0.0
+    )
+    if grain_sources and grain_collider_skin > 0.0:
+        print(
+            f"Granular collider skin: {grain_collider_skin:g} m "
+            "(anti-tunnelling, display radius unchanged)"
+        )
 
     surface_boundary = build_boundary_particles(scene, spacing=sph_cfg.dp)
     boundary = build_layered_wall_particles(surface_boundary, sph_cfg.dp, sph_cfg.support, sph_cfg.rho0)
@@ -645,7 +654,7 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
         fluid_grain_acc, grain_hydro_acc, fluid_grain_pairs = couple_fluid_grains(
             pos, vel, rho, sph_cfg.mass,
             grain_pos, grain_vel, grain_radii, grain_masses,
-            sph_cfg.gravity, sph_cfg.support,
+            sph_cfg.gravity, sph_cfg.support, dt=dt,
         )
         acc = (
             acc_q + acc_base + acc_visc + fs_state["acc"]
@@ -707,10 +716,13 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
                 iterations=settings.granular_iterations,
             )
             if settings.enable_collision and colliders:
+                grain_collision_radii = np.maximum(
+                    grain_radii, grain_collider_skin
+                )
                 (grain_wall_contacts, grain_linear_impulses,
                  grain_angular_impulses) = resolve_collisions(
                     grain_pos, grain_vel, colliders,
-                    particle_radius=grain_radii,
+                    particle_radius=grain_collision_radii,
                     restitution=grain_restitution,
                     friction_coefficient=grain_friction,
                     iterations=settings.collision_iterations,

@@ -32,6 +32,37 @@ def _cube(stage, path, lo, hi, role):
 
 
 class GranularTests(unittest.TestCase):
+    def test_small_mixed_grain_does_not_tunnel_through_coarse_collider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source_file = Path(directory) / "mixed_floor.usda"
+            stage = Usd.Stage.CreateNew(str(source_file))
+            UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+            UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+            _cube(stage, "/Fluid", (0.35, -0.05, 0.05), (0.45, 0.05, 0.15), "fluid")
+            grains = _cube(
+                stage, "/Grain", (-0.006, -0.006, 0.194),
+                (0.006, 0.006, 0.206), "granular_source",
+            )
+            grains.CreateAttribute(
+                "grasph:particleRadius", Sdf.ValueTypeNames.Double
+            ).Set(0.005)
+            _cube(stage, "/Floor", (-0.5, -0.3, -0.05), (0.5, 0.3, 0.0), "collider")
+            stage.GetRootLayer().Save()
+
+            result = run_simulation(
+                source_file, sph_cfg=SPHConfig(dp=0.05),
+                settings=SolverSettings(
+                    sim_time=0.3, output_fps=20.0, output_dir=directory,
+                    output_stem="mixed_floor_result", report_interval=100.0,
+                ),
+            )
+            with np.load(result.npz_file) as data:
+                final_count = int(data["granular_active_counts"][-1])
+                final_z = float(data["granular_positions"][-1, 0, 2])
+            self.assertEqual(final_count, 1)
+            self.assertGreater(final_z, 0.0)
+            self.assertLess(final_z, 0.05)
+
     def test_mixed_fluid_granular_writes_both_results(self):
         with tempfile.TemporaryDirectory() as directory:
             source_file = Path(directory) / "mixed.usda"

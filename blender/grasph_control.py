@@ -5,7 +5,7 @@ The numerical solver is launched as a separate process; Blender remains the
 scene editor and result viewer.
 """
 
-ADDON_VERSION = (0, 7, 0)
+ADDON_VERSION = (0, 7, 1)
 
 
 bl_info = {
@@ -252,6 +252,27 @@ def validate_scene(scene):
             "Mixed fluid/granular mode enabled: grains use buoyancy and drag "
             "with equal-and-opposite reaction on the SPH fluid."
         )
+        unit_scale = float(scene.unit_settings.scale_length or 1.0)
+        dp = float(scene.grasph_scene.dp)
+        fluid_estimate = sum(
+            max(0, int(float(obj.dimensions[0]) * unit_scale / dp))
+            * max(0, int(float(obj.dimensions[1]) * unit_scale / dp))
+            * max(0, int(float(obj.dimensions[2]) * unit_scale / dp))
+            for obj in fluid_objects
+        )
+        if fluid_estimate < 64:
+            warnings.append(
+                f"Mixed scene has only about {fluid_estimate} fluid particles at "
+                f"spacing {dp:g} m; reduce Particle Spacing for stable coupling."
+            )
+        smallest_radius = min(
+            obj.grasph.granular_radius for obj in granular_objects
+        )
+        if smallest_radius < 0.2 * dp:
+            warnings.append(
+                f"Granular radius {smallest_radius:g} m is much smaller than fluid "
+                f"spacing {dp:g} m; coupling will be coarse."
+            )
     dynamic_bodies = [obj for obj in tagged if obj.grasph.role == "DYNAMIC_BODY"]
     if fluid_objects and dynamic_bodies and not scene.grasph_scene.enable_solid_coupling:
         warnings.append(

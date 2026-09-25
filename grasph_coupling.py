@@ -8,7 +8,7 @@ from grasph_sph import build_cross_neighbor_pairs
 def couple_fluid_grains(
     fluid_pos, fluid_vel, fluid_rho, fluid_mass,
     grain_pos, grain_vel, grain_radii, grain_masses,
-    gravity, support, drag_coefficient=0.47,
+    gravity, support, dt=None, drag_coefficient=0.47,
 ):
     """Return fluid and grain accelerations with equal/opposite total force.
 
@@ -47,16 +47,29 @@ def couple_fluid_grains(
         fluid_rho[fluid_ids] * normalized,
     )
     wet = weight_sum > 0.0
+    representative_density = max(float(np.median(fluid_rho)), 1.0e-12)
+    particle_volume = float(fluid_mass) / representative_density
+    expected_weight_sum = max(
+        1.0, np.pi * float(support)**3 / (15.0 * particle_volume)
+    )
+    submergence = np.clip(weight_sum / expected_weight_sum, 0.0, 1.0)
     volume = (4.0 / 3.0) * np.pi * grain_radii**3
     area = np.pi * grain_radii**2
     relative_velocity = sampled_velocity - grain_vel
     relative_speed = np.linalg.norm(relative_velocity, axis=1)
-    buoyancy = -sampled_density[:, None] * volume[:, None] * np.asarray(
+    buoyancy = -submergence[:, None] * sampled_density[:, None] * volume[:, None] * np.asarray(
         gravity, dtype=np.float64
     )[None, :]
-    drag = (
+    drag = submergence[:, None] * (
         0.5 * float(drag_coefficient) * sampled_density * area * relative_speed
     )[:, None] * relative_velocity
+    if dt is not None and float(dt) > 0.0:
+        # Quadratic drag becomes stiff for tiny grains. Limit its explicit
+        # impulse so one step can approach, but never overshoot, fluid speed.
+        drag_magnitude = np.linalg.norm(drag, axis=1)
+        maximum_drag = grain_masses * relative_speed / float(dt)
+        scale = np.minimum(1.0, maximum_drag / np.maximum(drag_magnitude, 1.0e-30))
+        drag *= scale[:, None]
     force = buoyancy + drag
     force[~wet] = 0.0
     grain_acc[:] = force / grain_masses[:, None]
