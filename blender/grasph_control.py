@@ -5,7 +5,7 @@ The numerical solver is launched as a separate process; Blender remains the
 scene editor and result viewer.
 """
 
-ADDON_VERSION = (0, 7, 2)
+ADDON_VERSION = (0, 7, 3)
 
 
 bl_info = {
@@ -181,9 +181,18 @@ def _surface_modifier(obj):
     if obj is None or not hasattr(obj, "modifiers"):
         return None
     modifier = obj.modifiers.get("GraSPH Surface")
-    if modifier is None or modifier.node_group is None:
-        return None
-    return modifier
+    if modifier is not None and modifier.node_group is not None:
+        return modifier
+    # Legacy surfaces and copied objects may have an automatically suffixed
+    # modifier name. Identify those by the sockets published by GraSPH.
+    for candidate in obj.modifiers:
+        group = getattr(candidate, "node_group", None)
+        if candidate.type != "NODES" or group is None:
+            continue
+        sockets = group.get("grasph_sockets", {})
+        if "Mesh Radius" in sockets or "Show Surface" in sockets:
+            return candidate
+    return None
 
 
 def _find_surface_object(scene, active=None):

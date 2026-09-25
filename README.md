@@ -1,4 +1,4 @@
-# GraSPH fluid/granular coupling (Blender controls v0.7.2)
+# GraSPH fluid/granular coupling (Blender controls v0.7.3)
 
 Fluid Volume and Granular Source may now be used in the same scene. Spherical
 grains sample the local SPH velocity and density, receive buoyancy and
@@ -11,6 +11,7 @@ than the SPH collider voxel size. Partial-neighbour submergence and an
 explicit drag-impulse limiter make entry into sparse fluid less explosive.
 v0.7.2 replaces oversized collision skins with swept grain-to-mesh contact and
 rejects mixed runs with fewer than eight fluid particles.
+v0.7.3 restores Fluid Display controls for legacy or renamed surface modifiers.
 
 Dynamic Body now supports a sampled convex mesh collider instead of requiring
 a spherical envelope. In Blender choose `Dynamic Body` and `Convex Mesh`; the

@@ -22,7 +22,7 @@ bpy.context.scene.grasph_scene.project_root = ""
 assert Path(addon._surface_module(bpy.context.scene).__file__).resolve() == (
     root / "blender" / "grasph_surface.py"
 ).resolve()
-assert addon.ADDON_VERSION == (0, 7, 2)
+assert addon.ADDON_VERSION == (0, 7, 3)
 
 bpy.ops.object.select_all(action="SELECT")
 bpy.ops.object.delete(use_global=False)
@@ -39,9 +39,12 @@ surface_modifier = surface.modifiers.new("GraSPH Surface", "NODES")
 surface_modifier.node_group = bpy.data.node_groups.new(
     "Auto Find Surface Group", "GeometryNodeTree"
 )
+surface_modifier.node_group["grasph_sockets"] = {"Show Surface": "Socket_2"}
 bpy.context.view_layer.objects.active = None
 assert addon._find_surface_object(bpy.context.scene) == surface
 assert addon._find_surface_source(bpy.context.scene) == cloud
+surface_modifier.name = "GeometryNodes.001"
+assert addon._surface_modifier(surface) == surface_modifier
 
 bpy.data.objects.remove(surface, do_unlink=True)
 bpy.data.objects.remove(cloud, do_unlink=True)
