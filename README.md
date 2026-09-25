@@ -1,4 +1,4 @@
-# GraSPH fluid/granular coupling (Blender controls v0.7.4)
+# GraSPH fluid/granular coupling (Blender controls v0.8.0)
 
 Fluid Volume and Granular Source may now be used in the same scene. Spherical
 grains sample the local SPH velocity and density, receive buoyancy and
@@ -13,6 +13,9 @@ v0.7.2 replaces oversized collision skins with swept grain-to-mesh contact and
 rejects mixed runs with fewer than eight fluid particles.
 v0.7.3 restores Fluid Display controls for legacy or renamed surface modifiers.
 v0.7.4 fixes Fluid Display drawing under Blender 5's icon identifiers.
+v0.8.0 adds live scene workload estimates, quality and granular-material
+presets, clearer physics/display sections, timestep guidance and output-folder
+access from Blender.
 
 Dynamic Body now supports a sampled convex mesh collider instead of requiring
 a spherical envelope. In Blender choose `Dynamic Body` and `Convex Mesh`; the

@@ -22,9 +22,10 @@ bpy.context.scene.grasph_scene.project_root = ""
 assert Path(addon._surface_module(bpy.context.scene).__file__).resolve() == (
     root / "blender" / "grasph_surface.py"
 ).resolve()
-assert addon.ADDON_VERSION == (0, 7, 4)
+assert addon.ADDON_VERSION == (0, 8, 0)
 label_icons = bpy.types.UILayout.bl_rna.functions["label"].parameters["icon"].enum_items
 assert "GEOMETRY_NODES" in label_icons
+assert "FILE_FOLDER" in label_icons
 
 bpy.ops.object.select_all(action="SELECT")
 bpy.ops.object.delete(use_global=False)
@@ -69,6 +70,12 @@ wheel.grasph.collider_friction = 0.33
 wheel.grasph.collider_restitution = 0.2
 wheel.grasph.collider_rolling_friction = 0.015
 
+summary = addon.scene_summary(bpy.context.scene)
+assert summary["fluid_sources"] == 1
+assert summary["colliders"] == 2
+assert bpy.ops.grasph.quality_preset(preset="DRAFT") == {"FINISHED"}
+assert abs(bpy.context.scene.grasph_scene.dp - 0.05) < 1e-6
+
 errors, warnings = addon.validate_scene(bpy.context.scene)
 assert not errors, errors
 
@@ -110,6 +117,12 @@ grains.grasph.granular_flow_rate = 42.0
 grains.grasph.granular_initial_velocity = (0.0, 1.5, -0.25)
 grains.grasph.granular_start_time = 0.2
 grains.grasph.granular_end_time = 0.8
+bpy.context.view_layer.objects.active = grains
+grains.select_set(True)
+grains.grasph.granular_material_preset = "GRAVEL"
+assert bpy.ops.grasph.granular_material_preset() == {"FINISHED"}
+assert abs(grains.grasph.granular_density - 1800.0) < 1e-6
+assert abs(grains.grasph.granular_friction - 0.65) < 1e-6
 cube("Granular Tank Test", "STATIC", (0.0, 0.0, 0.0))
 cube("Mixed Fluid Test", "FLUID", (-0.5, 0.0, 0.5))
 dynamic = cube("Dynamic Body Test", "DYNAMIC_BODY", (0.5, 0.0, 0.5))
@@ -129,7 +142,7 @@ granular_prim = next(
     if prim.GetAttribute("grasph:role").Get() == "granular_source"
 )
 assert abs(granular_prim.GetAttribute("grasph:particleRadius").Get() - 0.031) < 1e-6
-assert abs(granular_prim.GetAttribute("grasph:density").Get() - 1450.0) < 1e-6
+assert abs(granular_prim.GetAttribute("grasph:density").Get() - 1800.0) < 1e-6
 assert granular_prim.GetAttribute("grasph:sourceMode").Get() == "flow"
 assert abs(granular_prim.GetAttribute("grasph:flowRate").Get() - 42.0) < 1e-6
 assert tuple(granular_prim.GetAttribute("grasph:initialVelocity").Get()) == (0.0, 1.5, -0.25)

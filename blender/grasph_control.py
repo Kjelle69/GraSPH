@@ -5,7 +5,7 @@ The numerical solver is launched as a separate process; Blender remains the
 scene editor and result viewer.
 """
 
-ADDON_VERSION = (0, 7, 4)
+ADDON_VERSION = (0, 8, 0)
 
 
 bl_info = {
@@ -21,6 +21,7 @@ bl_info = {
 import os
 from pathlib import Path
 import importlib.util
+import math
 import re
 import shlex
 import subprocess
@@ -60,6 +61,20 @@ ROLE_TO_USD = {
     "DYNAMIC_HINGE": "collider",
     "DYNAMIC_BODY": "collider",
     "IGNORE": "ignore",
+}
+
+QUALITY_PRESETS = {
+    "DRAFT": {"dp": 0.05, "granular_dt": 0.001, "granular_iterations": 4, "output_fps": 24.0},
+    "BALANCED": {"dp": 0.025, "granular_dt": 0.0005, "granular_iterations": 6, "output_fps": 30.0},
+    "QUALITY": {"dp": 0.0125, "granular_dt": 0.00025, "granular_iterations": 10, "output_fps": 30.0},
+}
+
+GRANULAR_MATERIAL_PRESETS = {
+    "SAND": (1600.0, 0.55, 0.05, 0.08),
+    "GRAVEL": (1800.0, 0.65, 0.10, 0.12),
+    "GRAIN": (780.0, 0.40, 0.08, 0.04),
+    "RUBBER": (1100.0, 0.80, 0.65, 0.08),
+    "STEEL": (7850.0, 0.25, 0.30, 0.01),
 }
 
 _RUNNING = None
@@ -249,6 +264,47 @@ def _object_center(obj, settings):
     return tuple(float(v) for v in settings.axle_center)
 
 
+def scene_summary(scene):
+    """Cheap UI estimate; the solver remains the authority after export."""
+    tagged = _tagged_objects(scene)
+    fluids = [obj for obj in tagged if obj.grasph.role == "FLUID"]
+    grains = [obj for obj in tagged if obj.grasph.role == "GRANULAR_SOURCE"]
+    colliders = [obj for obj in tagged if obj.grasph.role in {
+        "STATIC", "KINEMATIC", "DYNAMIC_HINGE", "DYNAMIC_BODY"
+    }]
+    dynamic = [obj for obj in tagged if obj.grasph.role in {
+        "DYNAMIC_HINGE", "DYNAMIC_BODY"
+    }]
+    scale = float(scene.unit_settings.scale_length or 1.0)
+    dp = max(float(scene.grasph_scene.dp), 1.0e-12)
+
+    def packed_count(obj, spacing):
+        return math.prod(
+            max(0, int(float(dimension) * scale / spacing))
+            for dimension in obj.dimensions
+        )
+
+    fluid_particles = sum(packed_count(obj, dp) for obj in fluids)
+    grain_particles = 0
+    for obj in grains:
+        settings = obj.grasph
+        if settings.granular_source_mode == "FLOW":
+            duration = max(0.0, settings.granular_end_time - settings.granular_start_time)
+            grain_particles += int(settings.granular_flow_rate * duration)
+        elif settings.granular_radius > 0.0:
+            grain_particles += packed_count(obj, 2.0 * settings.granular_radius)
+    total = fluid_particles + grain_particles
+    memory_mb = (fluid_particles * 360 + grain_particles * 220) / (1024.0 ** 2)
+    workload = "Light" if total < 10000 else "Medium" if total < 50000 else "Heavy"
+    return {
+        "fluid_sources": len(fluids), "granular_sources": len(grains),
+        "colliders": len(colliders), "dynamic": len(dynamic),
+        "fluid_particles": fluid_particles, "grain_particles": grain_particles,
+        "memory_mb": memory_mb, "workload": workload,
+        "mixed": bool(fluids and grains),
+    }
+
+
 def validate_scene(scene):
     errors, warnings = [], []
     tagged = _tagged_objects(scene)
@@ -304,6 +360,14 @@ def validate_scene(scene):
             "Dynamic Body objects remain fixed during fluid simulation until "
             "Fluid / Solid Coupling is enabled in Advanced Settings."
         )
+    if granular_objects:
+        smallest_radius = min(obj.grasph.granular_radius for obj in granular_objects)
+        timestep_hint = 0.15 * math.sqrt(max(smallest_radius, 1.0e-12) / 9.81)
+        if scene.grasph_scene.granular_dt > timestep_hint:
+            warnings.append(
+                f"Granular Time Step {scene.grasph_scene.granular_dt:g} s is large "
+                f"for radius {smallest_radius:g} m; try {timestep_hint:.4g} s or less."
+            )
 
     for obj in tagged:
         settings = obj.grasph
@@ -575,6 +639,15 @@ class GraSPHObjectSettings(PropertyGroup):
         name="Particle Radius", description="Radius of each spherical grain in metres",
         default=0.025, min=1.0e-6, subtype="DISTANCE",
     )
+    granular_material_preset: EnumProperty(
+        name="Material Preset",
+        items=(("SAND", "Sand", "Dense, dissipative sand"),
+               ("GRAVEL", "Gravel", "Rough grains with rolling resistance"),
+               ("GRAIN", "Grain", "Light agricultural grain"),
+               ("RUBBER", "Rubber Pellets", "High friction and high bounce"),
+               ("STEEL", "Steel Shot", "Dense, smooth metal spheres")),
+        default="SAND",
+    )
     granular_source_mode: EnumProperty(
         name="Source Type",
         items=(("VOLUME", "Granular Volume", "Create an initial packed volume"),
@@ -717,6 +790,50 @@ class GRASPH_OT_assign_selected(Operator):
         for obj in context.selected_objects:
             obj.grasph.role = role
         self.report({"INFO"}, f"Assigned {role} to {len(context.selected_objects)} object(s)")
+        return {"FINISHED"}
+
+
+class GRASPH_OT_quality_preset(Operator):
+    bl_idname = "grasph.quality_preset"
+    bl_label = "Apply Quality Preset"
+    bl_options = {"REGISTER", "UNDO"}
+
+    preset: EnumProperty(
+        items=(("DRAFT", "Draft", "Fast scene check"),
+               ("BALANCED", "Balanced", "General-purpose settings"),
+               ("QUALITY", "Quality", "Finer, slower simulation")),
+    )
+
+    def execute(self, context):
+        values = QUALITY_PRESETS[self.preset]
+        settings = context.scene.grasph_scene
+        for name, value in values.items():
+            setattr(settings, name, value)
+        self.report({"INFO"}, f"Applied {self.preset.title()} preset")
+        return {"FINISHED"}
+
+
+class GRASPH_OT_granular_material_preset(Operator):
+    bl_idname = "grasph.granular_material_preset"
+    bl_label = "Apply Material Preset"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        active = context.active_object
+        if active is None or active.grasph.role != "GRANULAR_SOURCE":
+            self.report({"ERROR"}, "Select a Granular Source")
+            return {"CANCELLED"}
+        targets = [obj for obj in context.selected_objects
+                   if obj.grasph.role == "GRANULAR_SOURCE"] or [active]
+        preset = active.grasph.granular_material_preset
+        density, friction, restitution, rolling = GRANULAR_MATERIAL_PRESETS[preset]
+        for obj in targets:
+            obj.grasph.granular_material_preset = preset
+            obj.grasph.granular_density = density
+            obj.grasph.granular_friction = friction
+            obj.grasph.granular_restitution = restitution
+            obj.grasph.granular_rolling_friction = rolling
+        self.report({"INFO"}, f"Applied {preset.title()} to {len(targets)} source(s)")
         return {"FINISHED"}
 
 
@@ -937,6 +1054,23 @@ class GRASPH_OT_stop(Operator):
         return {"FINISHED"}
 
 
+class GRASPH_OT_open_output_folder(Operator):
+    bl_idname = "grasph.open_output_folder"
+    bl_label = "Open Output Folder"
+
+    def execute(self, context):
+        folder = _path(context.scene.grasph_scene.output_dir)
+        if not folder.is_dir():
+            self.report({"ERROR"}, f"Output folder does not exist: {folder}")
+            return {"CANCELLED"}
+        try:
+            bpy.ops.wm.path_open(filepath=str(folder))
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
 class GRASPH_OT_open_result(Operator):
     bl_idname = "grasph.open_result"
     bl_label = "Import Last Result"
@@ -1070,8 +1204,12 @@ class GRASPH_PT_entities(Panel):
             box.prop(settings, "body_angular_damping")
         elif settings.role == "GRANULAR_SOURCE":
             box = layout.box()
+            box.label(text="Granular Physics")
             box.prop(settings, "granular_source_mode")
             box.prop(settings, "granular_radius")
+            preset_row = box.row(align=True)
+            preset_row.prop(settings, "granular_material_preset", text="Material")
+            preset_row.operator("grasph.granular_material_preset", text="Apply")
             box.prop(settings, "granular_density")
             box.prop(settings, "granular_friction")
             box.prop(settings, "granular_restitution")
@@ -1105,6 +1243,26 @@ class GRASPH_PT_simulation(Panel):
         row.alignment = "CENTER"
         row.label(text=f"GraSPH Controls v{version}", icon="INFO")
         layout.separator()
+
+        summary = scene_summary(context.scene)
+        summary_box = layout.box()
+        summary_box.label(text="Scene Summary")
+        row = summary_box.row(align=True)
+        row.label(text=f"Fluid: {summary['fluid_particles']:,}")
+        row.label(text=f"Grains: {summary['grain_particles']:,}")
+        row = summary_box.row(align=True)
+        row.label(text=f"Colliders: {summary['colliders']}")
+        row.label(text=f"Dynamic: {summary['dynamic']}")
+        coupling = "Mixed coupling ON" if summary["mixed"] else "Single phase"
+        summary_box.label(
+            text=f"{summary['workload']} workload · ~{summary['memory_mb']:.1f} MB · {coupling}"
+        )
+        errors, warnings = validate_scene(context.scene)
+        for message in errors[:2]:
+            summary_box.label(text=message[:100], icon="ERROR")
+        for message in warnings[:3]:
+            summary_box.label(text=message[:100], icon="INFO")
+
         layout.prop(settings, "project_root")
         layout.prop(settings, "auto_export")
         source_row = layout.row()
@@ -1115,13 +1273,25 @@ class GRASPH_PT_simulation(Panel):
         export_row = row.row(align=True)
         export_row.enabled = not settings.auto_export
         export_row.operator("grasph.export_usd")
+        preset_box = layout.box()
+        preset_box.label(text="Quality Presets")
+        row = preset_box.row(align=True)
+        for preset, label in (("DRAFT", "Draft"), ("BALANCED", "Balanced"),
+                              ("QUALITY", "Quality")):
+            operator = row.operator("grasph.quality_preset", text=label)
+            operator.preset = preset
+
         box = layout.box()
-        box.prop(settings, "python_command")
+        box.label(text="Physics Resolution")
         box.prop(settings, "sim_time")
         box.prop(settings, "dp")
-        box.prop(settings, "output_fps")
-        box.prop(settings, "output_dir")
-        box.prop(settings, "output_name")
+        box.label(text="Smaller spacing = more particles and longer runtime", icon="INFO")
+        output_box = layout.box()
+        output_box.label(text="Output")
+        output_box.prop(settings, "output_fps")
+        output_box.prop(settings, "output_dir")
+        output_box.prop(settings, "output_name")
+        output_box.prop(settings, "python_command")
         box.prop(settings, "show_advanced", toggle=True)
         if settings.show_advanced:
             advanced = box.column(align=True)
@@ -1162,7 +1332,9 @@ class GRASPH_PT_simulation(Panel):
             if settings.run_status != "Idle":
                 icon = "CHECKMARK" if settings.run_status == "Complete" else "INFO"
                 box.label(text=settings.run_status, icon=icon)
-        layout.operator("grasph.open_result", icon="IMPORT")
+        row = layout.row(align=True)
+        row.operator("grasph.open_result", icon="IMPORT")
+        row.operator("grasph.open_output_folder", icon="FILE_FOLDER")
         layout.prop(settings, "create_surface")
         if settings.log_file:
             layout.label(text="Log: " + Path(settings.log_file).name, icon="TEXT")
@@ -1182,6 +1354,7 @@ class GRASPH_PT_display(Panel):
 
     def draw(self, context):
         layout = self.layout
+        layout.label(text="Visual settings only; simulation is unchanged", icon="INFO")
         layout.operator("grasph.refresh_surface")
         surface = _find_surface_object(context.scene, context.active_object)
         modifier = _surface_modifier(surface)
@@ -1208,6 +1381,7 @@ class GRASPH_PT_granular_display(Panel):
 
     def draw(self, context):
         layout = self.layout
+        layout.label(text="Visual grain size only", icon="INFO")
         layout.operator("grasph.refresh_granular_display")
         obj = _find_granular_result(context.scene, context.active_object)
         modifier = _granular_modifier(obj)
@@ -1226,10 +1400,13 @@ CLASSES = (
     GraSPHObjectSettings,
     GraSPHSceneSettings,
     GRASPH_OT_assign_selected,
+    GRASPH_OT_quality_preset,
+    GRASPH_OT_granular_material_preset,
     GRASPH_OT_validate,
     GRASPH_OT_export,
     GRASPH_OT_run,
     GRASPH_OT_stop,
+    GRASPH_OT_open_output_folder,
     GRASPH_OT_open_result,
     GRASPH_OT_refresh_surface,
     GRASPH_OT_refresh_granular_display,
