@@ -53,6 +53,9 @@ class DynamicBodyData:
     collision_radius: float
     collision_margin: float
     collision_samples: np.ndarray
+    joint_type: str = "free"
+    joint_axis: np.ndarray | None = None
+    joint_anchor: np.ndarray | None = None
 
 
 @dataclass
@@ -163,18 +166,107 @@ def _triangulate(mesh_prim, vertices, time_code):
     indices = mesh.GetFaceVertexIndicesAttr().Get(time_code) or []
     triangles = []
     cursor = 0
-    for count in counts:
+    for face_index, count in enumerate(counts):
         count = int(count)
         face = [int(v) for v in indices[cursor:cursor + count]]
         cursor += count
         if count < 3:
             continue
-        i0 = face[0]
-        for k in range(1, count - 1):
-            triangles.append((vertices[i0], vertices[face[k]], vertices[face[k + 1]]))
+        points = np.asarray(vertices[face], dtype=np.float64)
+        # USD permits concave n-gons. A fan from vertex zero fills concave
+        # cut-outs (e.g. an open tank rim), creating invisible collision lids.
+        # Ear clipping in the dominant plane preserves the actual polygon.
+        normal = np.zeros(3, dtype=np.float64)
+        for a, b in zip(points, np.roll(points, -1, axis=0)):
+            normal += np.array((
+                (a[1] - b[1]) * (a[2] + b[2]),
+                (a[2] - b[2]) * (a[0] + b[0]),
+                (a[0] - b[0]) * (a[1] + b[1]),
+            ))
+        drop_axis = int(np.argmax(np.abs(normal)))
+        projected = np.delete(points, drop_axis, axis=1)
+        span = max(float(np.ptp(projected, axis=0).max()), 1.0)
+        eps = span * span * 1.0e-12
+
+        def cross2(a, b, c):
+            ab = b - a
+            ac = c - a
+            return ab[0] * ac[1] - ab[1] * ac[0]
+
+        # Remove consecutive duplicate and collinear corners before clipping.
+        ring = list(range(count))
+        changed = True
+        while changed and len(ring) > 3:
+            changed = False
+            for j, current in enumerate(ring):
+                previous = ring[j - 1]
+                following = ring[(j + 1) % len(ring)]
+                if (np.linalg.norm(projected[current] - projected[previous]) <= eps
+                        or abs(cross2(projected[previous], projected[current],
+                                      projected[following])) <= eps):
+                    ring.pop(j)
+                    changed = True
+                    break
+
+        area2 = sum(
+            projected[ring[j], 0] * projected[ring[(j + 1) % len(ring)], 1]
+            - projected[ring[(j + 1) % len(ring)], 0] * projected[ring[j], 1]
+            for j in range(len(ring))
+        )
+        if abs(area2) <= eps:
+            raise ValueError(
+                f"USD mesh {mesh_prim.GetPath()} face {face_index} is degenerate"
+            )
+        orientation = 1.0 if area2 > 0.0 else -1.0
+        face_triangles = []
+        while len(ring) > 3:
+            ear_found = False
+            for j, current in enumerate(ring):
+                previous = ring[j - 1]
+                following = ring[(j + 1) % len(ring)]
+                a, b, c = (projected[index] for index in (previous, current, following))
+                if orientation * cross2(a, b, c) <= eps:
+                    continue
+                contains_corner = False
+                for other in ring:
+                    if other in (previous, current, following):
+                        continue
+                    p = projected[other]
+                    side0 = orientation * cross2(a, b, p)
+                    side1 = orientation * cross2(b, c, p)
+                    side2 = orientation * cross2(c, a, p)
+                    if min(side0, side1, side2) >= -eps:
+                        contains_corner = True
+                        break
+                if contains_corner:
+                    continue
+                face_triangles.append((face[previous], face[current], face[following]))
+                ring.pop(j)
+                ear_found = True
+                break
+            if not ear_found:
+                raise ValueError(
+                    f"Could not triangulate USD mesh {mesh_prim.GetPath()} "
+                    f"face {face_index}; check for self-intersections"
+                )
+        face_triangles.append(tuple(face[index] for index in ring))
+        triangles.extend(
+            (vertices[a], vertices[b], vertices[c])
+            for a, b, c in face_triangles
+        )
     if not triangles:
         return np.empty((0, 3, 3), dtype=np.float64)
-    return np.asarray(triangles, dtype=np.float64)
+    triangles = np.asarray(triangles, dtype=np.float64)
+    # A reflected Xform (for example Blender objects exported with a negative
+    # scale) reverses geometric winding. Preserve the authored USD face
+    # orientation in world space so collision normals keep their intended
+    # direction. USD also supports explicitly left-handed meshes.
+    orientation = mesh.GetOrientationAttr().Get(time_code) or UsdGeom.Tokens.rightHanded
+    world_xform = UsdGeom.XformCache(time_code).GetLocalToWorldTransform(mesh_prim)
+    reflected = world_xform.GetDeterminant3() < 0.0
+    if (orientation == UsdGeom.Tokens.leftHanded) != reflected:
+        triangles = triangles[:, (0, 2, 1), :]
+    return triangles
 
 
 def _role_for_prim(prim):
@@ -366,6 +458,9 @@ def _dynamic_body_for_prim(prim, mesh_data):
     collision_radius, _ = _inherited_attribute(prim, "grasph:collisionRadius")
     collision_shape, _ = _inherited_attribute(prim, "grasph:collisionShape")
     collision_margin, _ = _inherited_attribute(prim, "grasph:collisionMargin")
+    joint_type, _ = _inherited_attribute(prim, "grasph:jointType")
+    joint_axis, _ = _inherited_attribute(prim, "grasph:jointAxis")
+    joint_anchor, _ = _inherited_attribute(prim, "grasph:jointAnchor")
     if physics_owner is not None:
         mass_api = UsdPhysics.MassAPI(physics_owner)
         physics_mass = mass_api.GetMassAttr().Get()
@@ -441,6 +536,9 @@ def _dynamic_body_for_prim(prim, mesh_data):
         collision_radius=max(1.0e-6, float(0.1 if collision_radius is None else collision_radius)),
         collision_margin=max(1.0e-6, float(0.002 if collision_margin is None else collision_margin)),
         collision_samples=samples,
+        joint_type=str(joint_type or "free").strip().lower(),
+        joint_axis=(None if joint_axis is None else np.asarray(joint_axis, dtype=np.float64)),
+        joint_anchor=(None if joint_anchor is None else np.asarray(joint_anchor, dtype=np.float64)),
     )
 
 
@@ -723,7 +821,7 @@ def _axis_centers(lo, hi, dp):
     return start + np.arange(n, dtype=np.float64) * float(dp)
 
 
-def generate_fluid_particles(scene, dp):
+def generate_fluid_particles(scene, dp, particle_radius=0.0):
     """Spawn regular particles from FluidVolume world-space AABBs at USD start time."""
     dp = float(dp)
     parts = []
@@ -756,9 +854,43 @@ def generate_fluid_particles(scene, dp):
         _, keep = np.unique(keys, axis=0, return_index=True)
         out = out[np.sort(keep)]
 
+    out = exclude_solid_fluid_particles(out, scene.colliders, particle_radius)
     print()
     print(f"Total fluid particles: {len(out)}")
     return out
+
+
+def exclude_solid_fluid_particles(positions, meshes, particle_radius=0.0):
+    """Keep fluid outside solid volumes and clear its collision radius.
+
+    An AABB only culls queries; tank cavities remain fluid. Open sheets are
+    collision surfaces, not volumes; only their finite radius clearance is cut.
+    """
+    from grasph_collision import points_inside_closed_mesh, is_closed_triangle_mesh, closest_point_triangle_batch
+    radius = max(0.0, float(particle_radius))
+    keep = np.ones(len(positions), dtype=bool)
+    for mesh in meshes:
+        candidates = np.flatnonzero(keep & np.all(
+            (positions >= mesh.bounds_min - radius) & (positions <= mesh.bounds_max + radius), axis=1))
+        closed = is_closed_triangle_mesh(mesh.triangles)
+        if not len(candidates) or (not closed and radius == 0.0):
+            continue
+        removed = 0
+        for start in range(0, len(candidates), 8192):
+            ids = candidates[start:start + 8192]
+            query = positions[ids]
+            inside = points_inside_closed_mesh(query, mesh.triangles) if closed else np.zeros(len(ids), dtype=bool)
+            if radius > 0.0:
+                distance2 = np.full(len(ids), np.inf)
+                for a, b, c in mesh.triangles:
+                    delta = query - closest_point_triangle_batch(query, a, b, c)
+                    distance2 = np.minimum(distance2, np.einsum('ij,ij->i', delta, delta))
+                inside |= distance2 < radius**2
+            keep[ids[inside]] = False
+            removed += int(np.count_nonzero(inside))
+        if removed:
+            print(f"  Solid exclusion: {mesh.path}: {removed} initial overlapping fluid particles removed")
+    return positions[keep]
 
 
 def generate_granular_particles(scene):

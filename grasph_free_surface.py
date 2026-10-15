@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import numpy as np
+from grasph_collision import closest_point_triangle_batch
 
 from grasph_reference import hydrostatic_reference_state
 from grasph_sph import _scatter_add_vec3
@@ -62,10 +63,8 @@ def _point_in_triangle_batch(points, tri, tol=1.0e-10):
 def compute_geometry_normal_covariance(pos, triangles, normals, support):
     """Collider normal span near each fluid particle.
 
-    FIX5 adds an expanded triangle-AABB pre-cull.  It is conservative (AABB
-    expanded by support), so it removes only particles that cannot possibly
-    project inside the finite triangle within support.  Physics is unchanged,
-    while long scenes avoid testing every particle against every face.
+    Expanded triangle AABBs cull distant particles. Only outward-facing finite
+    faces within support contribute, including nearest edge/corner features.
     """
     n = len(pos)
     cov = np.zeros((n, 3, 3), dtype=np.float64)
@@ -81,7 +80,9 @@ def compute_geometry_normal_covariance(pos, triangles, normals, support):
         cand = np.flatnonzero(box)
         signed = (tri[0][None, :] - pos[cand]) @ normal
         d = np.abs(signed)
-        near_local = d <= float(support) + 1.0e-12
+        # Closed solid faces block their outward (fluid) side. A nearby back
+        # face must not block a real free surface across a rim or thin wall.
+        near_local = (d <= float(support) + 1.0e-12) & (signed <= 1.0e-12)
         if not np.any(near_local):
             continue
         idx = cand[near_local]
@@ -89,6 +90,16 @@ def compute_geometry_normal_covariance(pos, triangles, normals, support):
         signed_near = signed[near_local]
         projected = pos[idx] + signed_near[:, None] * normal[None, :]
         inside = _point_in_triangle_batch(projected, tri, tol=1.0e-9)
+        # A fluid kernel also intersects a solid across a finite edge/corner.
+        # Plane-projection-only tests miss BOTH faces just outside a convex
+        # corner and incorrectly seed a submerged "air" surface there.
+        # Admit those points only within the actual finite-triangle radius.
+        outside = ~inside
+        if np.any(outside):
+            closest = closest_point_triangle_batch(pos[idx[outside]], *tri)
+            edge_distance = np.linalg.norm(pos[idx[outside]] - closest, axis=1)
+            inside[outside] = edge_distance <= float(support) + 1.0e-12
+            dnear[outside] = edge_distance
         if not np.any(inside):
             continue
         hit = idx[inside]
@@ -215,7 +226,7 @@ def anchored_band_traction(pos, rho, air_missing, band, anchor, normals, surface
 def compute_atmospheric_state(
     pos, rho, rho_ref, pair_i, pair_j, gradW,
     boundary, wall_interactions, solid_triangles, solid_normals,
-    surface_level, sph_cfg, fs_cfg,
+    surface_level, sph_cfg, fs_cfg, active_mask=None,
 ):
     n = len(pos)
     if fs_cfg.mode == "none":
@@ -265,6 +276,16 @@ def compute_atmospheric_state(
 
     support_hG = sph_cfg.h * np.linalg.norm(air_missing, axis=1)
     shell = support_hG > fs_cfg.hG_threshold
+    # Anchored-band traction references the dominant pool's hydrostatic
+    # surface. Applying it to a disconnected droplet far above/below that pool
+    # creates fictitious pressure (and can launch runaway particles). Detached
+    # components still receive gravity and optional aerodynamic drag, but no
+    # pool-anchored free-surface traction.
+    if active_mask is not None:
+        active_mask = np.asarray(active_mask, dtype=bool)
+        if active_mask.shape != (n,):
+            raise ValueError("active_mask must have one boolean per fluid particle")
+        shell &= active_mask
     band, anchor, normals = build_seed_connected_band_with_anchor(
         pos, pair_i, pair_j, air_missing, shell, fs_cfg
     )

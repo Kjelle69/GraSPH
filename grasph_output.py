@@ -196,3 +196,28 @@ def save_npz(output_file, **arrays):
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(output_file, **arrays)
     print(f"Saved: {output_file}")
+
+
+def write_usd_checkpoint(stage, frames, frame_times, fps, dp, output_file, **kwargs):
+    """Atomically replace a partial USD animation without touching final output."""
+    import gc
+
+    output_path = Path(output_file).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_name(output_path.stem + ".tmp" + output_path.suffix)
+    try:
+        temporary.unlink(missing_ok=True)
+        write_usd_animation(
+            stage, frames, frame_times, fps, dp, temporary, **kwargs
+        )
+        gc.collect()
+        os.replace(temporary, output_path)
+    except PermissionError as error:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        print(f"USD checkpoint postponed; file is in use: {error}")
+        return False
+    print(f"Updated partial USD checkpoint: {output_path}")
+    return True

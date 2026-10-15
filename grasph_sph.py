@@ -16,6 +16,10 @@ except Exception:
 
 _NEIGHBOR_BACKEND = "auto"
 _NEIGHBOR_WORKERS = -1
+# Keep pairwise temporary arrays bounded.  A few million interactions can be
+# valid for a scene, but materialising an Mx3 force array in one go can fail on
+# Windows long before the solver's particle arrays are themselves exhausted.
+_PAIR_WORK_CHUNK = 8192
 
 def configure_neighbor_search(backend="auto", workers=-1):
     """Configure neighbour search globally for the NumPy solver.
@@ -331,6 +335,38 @@ def build_neighbor_pairs(pos, support):
     return _build_neighbor_pairs_grid(pos, support)
 
 
+class CachedFluidNeighborSearch:
+    """Verlet candidates; current strict-radius pairs are still exact."""
+
+    def __init__(self, skin):
+        self.skin = max(0.0, float(skin))
+        self.reference = None
+        self.support = None
+        self.pair_i = self.pair_j = np.empty(0, dtype=np.int32)
+
+    def query(self, pos, support):
+        rebuild = (self.reference is None or self.reference.shape != pos.shape
+                   or self.support != float(support))
+        if not rebuild and len(pos):
+            displacement = np.linalg.norm(pos - self.reference, axis=1).max()
+            rebuild = 2.0 * displacement >= self.skin
+        if rebuild:
+            self.pair_i, self.pair_j = build_neighbor_pairs(pos, support + self.skin)
+            self.reference = pos.copy()
+            self.support = float(support)
+        kept_i, kept_j = [], []
+        for start in range(0, len(self.pair_i), _PAIR_WORK_CHUNK):
+            i = self.pair_i[start:start + _PAIR_WORK_CHUNK]
+            j = self.pair_j[start:start + _PAIR_WORK_CHUNK]
+            rij = pos[i] - pos[j]
+            keep = np.einsum("ij,ij->i", rij, rij) < float(support) ** 2
+            kept_i.append(i[keep])
+            kept_j.append(j[keep])
+        if not kept_i:
+            return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
+        return np.concatenate(kept_i), np.concatenate(kept_j)
+
+
 def build_cross_neighbor_pairs(fluid_pos, other_pos, support):
     if active_neighbor_backend() == "ckdtree":
         return _build_cross_neighbor_pairs_ckdtree(fluid_pos, other_pos, support)
@@ -529,18 +565,21 @@ def compute_pressure_acceleration(
 ):
     n = len(rho)
     acc = np.zeros((n, 3), dtype=np.float64)
-
-    rhoi = rho[pair_i]
-    rhoj = rho[pair_j]
-    pi = pressure[pair_i]
-    pj = pressure[pair_j]
-
-    pressure_factor = mass * (pi / (rhoi * rhoi) + pj / (rhoj * rhoj))
-    pair_force = pressure_factor[:, None] * gradW
-
-    return _scatter_add_vec3(
-        n, pair_i, -pair_force, pair_j, pair_force
-    )
+    pair_count = len(pair_i)
+    for start in range(0, pair_count, _PAIR_WORK_CHUNK):
+        end = min(start + _PAIR_WORK_CHUNK, pair_count)
+        pi_idx = pair_i[start:end]
+        pj_idx = pair_j[start:end]
+        rhoi = rho[pi_idx]
+        rhoj = rho[pj_idx]
+        pi = pressure[pi_idx]
+        pj = pressure[pj_idx]
+        pressure_factor = mass * (pi / (rhoi * rhoi) + pj / (rhoj * rhoj))
+        pair_force = pressure_factor[:, None] * gradW[start:end]
+        acc += _scatter_add_vec3(
+            n, pi_idx, -pair_force, pj_idx, pair_force
+        )
+    return acc
 
 
 def compute_artificial_viscosity_acceleration(

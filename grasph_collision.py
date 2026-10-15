@@ -2,6 +2,36 @@ import time
 import numpy as np
 
 
+def points_inside_closed_mesh(points, triangles):
+    """Classify volume points by solid angle; winding orientation may reverse."""
+    points = np.asarray(points, dtype=np.float64)
+    angle = np.zeros(len(points))
+    for triangle in triangles:
+        a, b, c = (vertex[None, :] - points for vertex in triangle)
+        la, lb, lc = (np.linalg.norm(v, axis=1) for v in (a, b, c))
+        numerator = np.einsum("ij,ij->i", a, np.cross(b, c))
+        denominator = (la * lb * lc
+                       + np.einsum("ij,ij->i", a, b) * lc
+                       + np.einsum("ij,ij->i", b, c) * la
+                       + np.einsum("ij,ij->i", c, a) * lb)
+        angle += 2.0 * np.arctan2(numerator, denominator)
+    return np.abs(angle) > 2.0 * np.pi
+
+
+def is_closed_triangle_mesh(triangles):
+    """Require paired, oppositely oriented edges before treating a mesh as volume."""
+    triangles = np.asarray(triangles, dtype=np.float64)
+    if not len(triangles):
+        return False
+    _, ids = np.unique(triangles.reshape(-1, 3), axis=0, return_inverse=True)
+    ids = ids.reshape(-1, 3)
+    edges = np.concatenate((ids[:, [0, 1]], ids[:, [1, 2]], ids[:, [2, 0]]))
+    _, groups, counts = np.unique(np.sort(edges, axis=1), axis=0,
+                                  return_inverse=True, return_counts=True)
+    direction = np.where(edges[:, 0] < edges[:, 1], 1, -1)
+    return bool(np.all(counts == 2) and np.all(np.bincount(groups, weights=direction) == 0))
+
+
 # ============================================================
 # GraSPH Collision
 #

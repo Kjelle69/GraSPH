@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from grasph_collision import closest_point_triangle_batch
+from grasph_collision import closest_point_triangle_batch, points_inside_closed_mesh
 
 
 def axis_angle_matrix(axis, angle):
@@ -42,6 +42,26 @@ def world_inertia(body, state):
     return rotation @ np.diag(body.inertia) @ rotation.T
 
 
+def constrain_body_state(body, state):
+    """Project a world-attached prismatic/fixed body onto its allowed DOFs."""
+    joint_type = str(getattr(body, "joint_type", "free")).lower()
+    if joint_type == "fixed":
+        state["translation"][:] = 0.0
+        state["velocity"][:] = 0.0
+        state["rotation"][:] = np.eye(3)
+        state["omega"][:] = 0.0
+    elif joint_type == "prismatic":
+        axis = np.asarray(body.joint_axis, dtype=np.float64)
+        length = float(np.linalg.norm(axis))
+        if length < 1.0e-12:
+            raise RuntimeError(f"Prismatic body {body.path} has a zero joint axis")
+        axis = axis / length
+        state["translation"][:] = axis * float(np.dot(state["translation"], axis))
+        state["velocity"][:] = axis * float(np.dot(state["velocity"], axis))
+        state["rotation"][:] = np.eye(3)
+        state["omega"][:] = 0.0
+
+
 def _contact_samples(body, state):
     if body.collision_shape == "sphere":
         return (body.center + state["translation"])[None, :], body.collision_radius
@@ -74,7 +94,28 @@ def _oriented_surface_query(points, triangles):
         best_d2[better] = d2[better]
         best_point[better] = closest[better]
         best_normal[better] = normal / length
-    signed_distance = np.einsum("ij,ij->i", points - best_point, best_normal)
+    delta = points - best_point
+    distance = np.sqrt(np.maximum(best_d2, 0.0))
+    # Use the nearest-feature distance, not only its projection on the face
+    # normal.  The latter incorrectly extends every triangle's plane
+    # infinitely far past its edges (e.g. making a tank rim act like a lid).
+    side = np.einsum("ij,ij->i", delta, best_normal)
+    inside = side < 0.0
+    # At an edge/vertex the closest triangle's normal alone cannot classify
+    # inside/outside: roundoff can select an adjacent face and turn a distant
+    # exterior point into a large negative penetration. Resolve ambiguous
+    # negative signs using the mesh's solid angle (4*pi inside a closed mesh).
+    tangent = delta - side[:, None] * best_normal
+    feature = np.linalg.norm(tangent, axis=1) > 1e-10 * (1.0 + distance)
+    ambiguous = inside & feature
+    if np.any(ambiguous):
+        inside[ambiguous] = points_inside_closed_mesh(points[ambiguous], triangles)
+    signed_distance = np.where(inside, -distance, distance)
+    # Corner contacts resolve along the nearest-feature gradient. Face
+    # contacts retain the authored face normal, including open thin surfaces.
+    feature &= distance > 1e-14
+    best_normal[feature] = delta[feature] / distance[feature, None]
+    best_normal[feature & inside] *= -1.0
     return signed_distance, best_normal
 
 
@@ -97,6 +138,8 @@ def resolve_body_contacts(
     for _ in range(max(1, int(iterations))):
         for path, state in body_states.items():
             body = scene.dynamic_bodies[path]
+            if getattr(body, "joint_type", "free") == "fixed":
+                continue
             body_material = scene.collider_materials.get(path, {})
             samples, contact_radius = _contact_samples(body, state)
 
@@ -104,7 +147,8 @@ def resolve_body_contacts(
                 if other_path == path:
                     continue
                 # A dynamic pair is solved only once.
-                if other_path in body_states and path > other_path:
+                if (other_path in body_states and path > other_path
+                        and getattr(scene.dynamic_bodies[other_path], "joint_type", "free") != "fixed"):
                     continue
 
                 # A sampled surface point can cross a very thin user margin
@@ -149,6 +193,9 @@ def resolve_body_contacts(
                 lever = point - center
 
                 other_state = body_states.get(other_path)
+                if (other_state is not None
+                        and getattr(scene.dynamic_bodies[other_path], "joint_type", "free") == "fixed"):
+                    other_state = None
                 other_velocity = np.asarray(
                     collider_velocities.get(other_path, np.zeros(3)), dtype=np.float64
                 )

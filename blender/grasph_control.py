@@ -5,7 +5,7 @@ The numerical solver is launched as a separate process; Blender remains the
 scene editor and result viewer.
 """
 
-ADDON_VERSION = (0, 9, 0)
+ADDON_VERSION = (0, 14, 0)
 
 
 bl_info = {
@@ -49,6 +49,7 @@ ROLE_ITEMS = (
     ("KINEMATIC", "Kinematic Collider", "Animated collider that drives the fluid"),
     ("DYNAMIC_HINGE", "Dynamic Hinge", "Collider driven by fluid torque around one axle"),
     ("DYNAMIC_BODY", "Dynamic Body", "Freely translating and rotating rigid collider"),
+    ("JOINT", "Joint Anchor", "Visible joint frame linked to a Dynamic Body"),
     ("IGNORE", "Visual Only", "Export visually but exclude from simulation"),
 )
 
@@ -60,8 +61,16 @@ ROLE_TO_USD = {
     "KINEMATIC": "collider",
     "DYNAMIC_HINGE": "collider",
     "DYNAMIC_BODY": "collider",
+    "JOINT": "joint",
     "IGNORE": "ignore",
 }
+
+JOINT_TYPE_ITEMS = (
+    ("REVOLUTE", "Revolute / Hinge", "One rotational degree of freedom"),
+    ("PRISMATIC", "Prismatic / Linear", "One translational degree of freedom"),
+    ("FREE", "Free", "No joint constraint; body remains fully dynamic"),
+    ("FIXED", "Fixed", "Lock this body to the world"),
+)
 
 QUALITY_PRESETS = {
     "DRAFT": {"dp": 0.05, "granular_dt": 0.001, "granular_iterations": 4, "output_fps": 24.0},
@@ -78,6 +87,7 @@ GRANULAR_MATERIAL_PRESETS = {
 }
 
 _RUNNING = None
+_RESET_REQUESTED = False
 
 
 def _tail_solver_log(log_file):
@@ -106,8 +116,300 @@ def _tag_redraw(context):
             area.tag_redraw()
 
 
+_COLLIDER_ROLES = {"STATIC", "KINEMATIC", "DYNAMIC_HINGE", "DYNAMIC_BODY"}
+_COLLIDER_OUTLINE_COLLECTION = "GraSPH Collider Outlines"
+_COLLIDER_DISPLAY_ITEMS = (
+    ("OFF", "Off", "Hide collider visualization"),
+    ("WIRE", "Wire", "Show collider edges only"),
+    ("SOLID", "Transparent Solid", "Show a pale-yellow transparent collider mesh"),
+    ("BOTH", "Both", "Show transparent surfaces and wire edges"),
+)
+# Keep datablock names, not RNA Object wrappers: a user can delete/reload a
+# preview object while a modal simulation is active, invalidating its wrapper.
+_PREVIEW_CLOUDS = {"fluid": None, "granular": None}
+_PREVIEW_LAST_PATHS = []
+
+
+def _refresh_collider_outlines(scene, display_mode):
+    if isinstance(display_mode, bool):
+        display_mode = "WIRE" if display_mode else "OFF"
+    display_mode = str(display_mode).upper()
+    collection = bpy.data.collections.get(_COLLIDER_OUTLINE_COLLECTION)
+    if collection is None and display_mode != "OFF":
+        collection = bpy.data.collections.new(_COLLIDER_OUTLINE_COLLECTION)
+        scene.collection.children.link(collection)
+        collection.hide_render = True
+    if collection is None:
+        return
+    for outline in list(collection.objects):
+        bpy.data.objects.remove(outline, do_unlink=True)
+    if display_mode == "OFF":
+        bpy.data.collections.remove(collection)
+        return
+
+    show_wire = display_mode in {"WIRE", "BOTH"}
+    show_solid = display_mode in {"SOLID", "BOTH"}
+    colors = {
+        "STATIC": (0.12, 0.75, 1.0, 1.0),
+        "KINEMATIC": (1.0, 0.65, 0.10, 1.0),
+        "DYNAMIC_HINGE": (0.95, 0.30, 0.90, 1.0),
+        "DYNAMIC_BODY": (0.25, 1.0, 0.40, 1.0),
+    }
+    for source in scene.objects:
+        role = getattr(getattr(source, "grasph", None), "role", "NONE")
+        if role not in _COLLIDER_ROLES or source.type != "MESH":
+            continue
+        variants = []
+        if show_solid:
+            variants.append(("Solid", "SOLID"))
+        if show_wire:
+            variants.append(("Wire", "WIRE"))
+        for suffix, display_type in variants:
+            overlay = bpy.data.objects.new(
+                f"{source.name}_Collider{suffix}", source.data
+            )
+            collection.objects.link(overlay)
+            overlay.matrix_world = source.matrix_world.copy()
+            overlay.display_type = display_type
+            overlay.show_in_front = display_type == "WIRE"
+            overlay.hide_render = True
+            overlay.color = (1.0, 0.88, 0.24, 0.24) if display_type == "SOLID" else colors[role]
+            overlay.show_transparent = display_type == "SOLID"
+            overlay["grasph:collider_outline"] = True
+            overlay["grasph:collider_visual_mode"] = display_type
+            overlay["grasph:outline_source"] = source.name
+            if display_type == "SOLID":
+                material = bpy.data.materials.get("GraSPH Collider Preview")
+                if material is None:
+                    material = bpy.data.materials.new("GraSPH Collider Preview")
+                material.diffuse_color = (1.0, 0.88, 0.24, 0.24)
+                if hasattr(material, "surface_render_method"):
+                    material.surface_render_method = "DITHERED"
+                material.use_nodes = False
+                overlay.data = source.data.copy()
+                overlay.data.materials.clear()
+                overlay.data.materials.append(material)
+            if hasattr(overlay, "grasph"):
+                overlay.grasph.role = "NONE"
+
+
+def _set_collider_outlines(self, context):
+    _refresh_collider_outlines(context.scene, self.collider_display)
+
+
+def _update_point_cloud(cloud, positions, velocity=None):
+    """Resize/update mesh vertices used as an instanced live particle cloud."""
+    positions = positions.reshape((-1, 3))
+    if len(cloud.vertices) != len(positions):
+        old_mesh = cloud
+        cloud = bpy.data.meshes.new(old_mesh.name + "_Live")
+        cloud.from_pydata(positions.tolist(), [], [])
+        if old_mesh.users == 0:
+            bpy.data.meshes.remove(old_mesh)
+    if len(positions):
+        cloud.vertices.foreach_set("co", positions.astype("f", copy=False).ravel())
+    cloud.update()
+    return cloud
+
+
+def _add_live_particle_display(obj, kind, radius):
+    group = bpy.data.node_groups.new(f"GraSPH Live {kind.title()} Display", "GeometryNodeTree")
+    group.is_modifier = True
+    interface = group.interface
+    interface.new_socket(name="Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+    interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    radius_socket = interface.new_socket(
+        name="Radius", in_out="INPUT", socket_type="NodeSocketFloat"
+    )
+    radius_socket.default_value = float(radius)
+    radius_socket.min_value = 1.0e-6
+    nodes, links = group.nodes, group.links
+    entry = nodes.new("NodeGroupInput")
+    sphere = nodes.new("GeometryNodeMeshIcoSphere")
+    sphere.inputs["Subdivisions"].default_value = 1
+    instances = nodes.new("GeometryNodeInstanceOnPoints")
+    output = nodes.new("NodeGroupOutput")
+    links.new(entry.outputs["Geometry"], instances.inputs["Points"])
+    links.new(entry.outputs["Radius"], sphere.inputs["Radius"])
+    links.new(sphere.outputs["Mesh"], instances.inputs["Instance"])
+    links.new(instances.outputs["Instances"], output.inputs["Geometry"])
+    modifier = obj.modifiers.new(f"GraSPH Live {kind.title()} Display", "NODES")
+    modifier.node_group = group
+    modifier[radius_socket.identifier] = float(radius)
+
+
+def _preview_source_object(scene, prim_path, role):
+    # USD mesh paths commonly end in the mesh datablock name, while the
+    # GraSPH role lives on the Blender object represented by its parent Xform.
+    # Prefer the parent component so `/root/Cube_002/Cube_004` resolves to
+    # `Cube.002`, even if another role-tagged Blender object is named
+    # `Cube.004`. Fall back to other components for direct-mesh USD prims.
+    path_names = [
+        re.sub(r"[^A-Za-z0-9_]+", "_", part)
+        for part in str(prim_path).split("/") if part and part.lower() != "root"
+    ]
+    candidates = [
+        obj for obj in scene.objects
+        if getattr(getattr(obj, "grasph", None), "role", "NONE") == role
+    ]
+    preferred_names = list(reversed(path_names[:-1])) + path_names[-1:]
+    for path_name in preferred_names:
+        for obj in candidates:
+            normalized_name = re.sub(r"[^A-Za-z0-9_]+", "_", obj.name)
+            if obj.name == path_name or normalized_name == path_name:
+                return obj
+    return None
+    return cloud
+
+
+def _update_live_preview(scene, path):
+    global _PREVIEW_CLOUDS, _PREVIEW_LAST_PATHS
+    path = Path(path)
+    if not path.is_file():
+        return None
+    import numpy as np
+    try:
+        with np.load(path) as preview:
+            fluid = preview["positions"].copy()
+            fluid_velocity = preview["velocity"].copy()
+            grains = preview["granular_positions"].copy()
+            grain_velocity = preview["granular_velocity"].copy()
+            time_value = float(preview["time"])
+            progress = float(preview["progress"])
+            body_paths = preview["body_paths"].astype(str).tolist()
+            body_translations = preview["body_translations"].copy()
+            body_rotations = preview["body_rotations"].copy()
+            hinge_paths = preview["hinge_paths"].astype(str).tolist()
+            hinge_angles = preview["hinge_angles"].copy()
+    except (OSError, ValueError, KeyError):
+        return None
+
+    for kind, coordinates, speeds in (
+        ("fluid", fluid, fluid_velocity), ("granular", grains, grain_velocity),
+    ):
+        cloud_name = _PREVIEW_CLOUDS.get(kind)
+        cloud = bpy.data.objects.get(cloud_name) if cloud_name else None
+        if cloud is None or cloud.get("grasph:live_preview") != kind:
+            cloud_data = bpy.data.meshes.new(f"GraSPH Live {kind.title()} Data")
+            cloud = bpy.data.objects.new(f"GraSPH Live {kind.title()} Preview", cloud_data)
+            scene.collection.objects.link(cloud)
+            cloud["grasph:live_preview"] = kind
+            cloud.hide_render = True
+        _PREVIEW_CLOUDS[kind] = cloud.name
+        old_data = cloud.data
+        updated_data = _update_point_cloud(old_data, coordinates, speeds)
+        if updated_data is not old_data:
+            cloud.data = updated_data
+            if old_data.users == 0:
+                bpy.data.meshes.remove(old_data)
+        if cloud.get("grasph:live_display_ready") != kind and len(coordinates):
+            try:
+                radius = (float(scene.grasph_scene.live_grain_radius)
+                          if kind == "granular" else
+                          max(float(scene.grasph_scene.dp) * 0.18, 1.0e-5))
+                _add_live_particle_display(cloud, kind, radius)
+                cloud["grasph:live_display_ready"] = kind
+            except Exception:
+                pass
+
+    for path_string, translation, rotation in zip(
+        body_paths, body_translations, body_rotations
+    ):
+        source = _preview_source_object(scene, path_string, "DYNAMIC_BODY")
+        if source is None:
+            continue
+        origin = source.get("grasph:preview_origin")
+        if origin is None:
+            origin = tuple(source.location)
+            source["grasph:preview_origin"] = origin
+        source.location = tuple(origin[i] + float(translation[i]) for i in range(3))
+        rotation_origin = source.get("grasph:preview_rotation_origin")
+        if rotation_origin is None:
+            rotation_origin = tuple(source.rotation_euler)
+            source["grasph:preview_rotation_origin"] = rotation_origin
+        source.rotation_euler = tuple(
+            float(rotation_origin[i]) + float(rotation[i]) for i in range(3)
+        )
+    for path_string, angle in zip(hinge_paths, hinge_angles):
+        source = _preview_source_object(scene, path_string, "DYNAMIC_HINGE")
+        if source is None:
+            continue
+        source.rotation_mode = "XYZ"
+        axis = source.grasph.axis
+        index = {"X": 0, "Y": 1, "Z": 2}[axis]
+        if source.name not in _PREVIEW_LAST_PATHS:
+            _PREVIEW_LAST_PATHS.append(source.name)
+            source["grasph:preview_rotation_origin"] = tuple(source.rotation_euler)
+        baseline = source.get("grasph:preview_rotation_origin", tuple(source.rotation_euler))
+        source.rotation_euler[index] = float(baseline[index]) + float(angle)
+    outline_collection = bpy.data.collections.get(_COLLIDER_OUTLINE_COLLECTION)
+    if outline_collection is not None:
+        for outline in outline_collection.objects:
+            source = scene.objects.get(outline.get("grasph:outline_source", ""))
+            if source is not None:
+                outline.matrix_world = source.matrix_world.copy()
+    settings = scene.grasph_scene
+    settings.live_preview_progress = 100.0 * progress
+    settings.live_preview_time = time_value
+    return progress, time_value
+
+
+def _clear_live_preview(scene):
+    global _PREVIEW_CLOUDS, _PREVIEW_LAST_PATHS
+    for obj in list(scene.objects):
+        if obj.get("grasph:live_preview") in {"fluid", "granular"}:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        else:
+            origin = obj.get("grasph:preview_origin")
+            rotation = obj.get("grasph:preview_rotation_origin")
+            if origin is not None:
+                obj.location = origin
+                del obj["grasph:preview_origin"]
+            if rotation is not None:
+                obj.rotation_euler = rotation
+                del obj["grasph:preview_rotation_origin"]
+    _PREVIEW_CLOUDS = {"fluid": None, "granular": None}
+    _PREVIEW_LAST_PATHS = []
+
+
+def _prepare_live_preview_for_run(scene, preview_file):
+    """Remove the previous run's viewport data and snapshot before launching."""
+    _clear_live_preview(scene)
+    try:
+        Path(preview_file).unlink(missing_ok=True)
+    except OSError:
+        # A stale snapshot must never be presented as the new run. If Windows
+        # has it locked, the timestamp guard below still prevents re-importing
+        # it as a fresh update.
+        pass
+
+
+def _reset_run_state(scene):
+    settings = scene.grasph_scene
+    checkpoint_path = str(_path(settings.output_dir) /
+                          (settings.output_name + "_checkpoint.usdc"))
+    for path in (settings.pause_file,
+                 str(_path(settings.output_dir) /
+                     (settings.output_name + "_live_preview.npz")),
+                 checkpoint_path):
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError:
+            pass
+    _clear_live_preview(scene)
+    settings.run_progress = 0.0
+    settings.live_preview_progress = 0.0
+    settings.live_preview_time = 0.0
+    settings.run_elapsed = "00:00"
+    settings.run_message = "Reset; ready to start from the beginning"
+    settings.run_status = "Ready"
+    settings.continue_from_result = False
+    settings.restart_npz = ""
+    settings.restart_time = 0.0
+
+
 def _discover_project_root():
-    """Find the repository when run as an add-on or a Blender text block."""
+    """Find the repository from the add-on, Blender file, or loaded text file."""
     starts = []
     try:
         starts.append(Path(__file__).resolve())
@@ -115,6 +417,16 @@ def _discover_project_root():
         pass
     if bpy.data.filepath:
         starts.append(Path(bpy.data.filepath).resolve())
+    # When this script is run from Blender's Text Editor, __file__ may be
+    # undefined (or point to the saved .blend). Text datablocks retain the
+    # source file path, which is the reliable project anchor in that workflow.
+    for text_block in getattr(bpy.data, "texts", ()):
+        text_path = str(getattr(text_block, "filepath", "") or "")
+        if text_path and Path(text_path).name.lower() == "grasph_control.py":
+            try:
+                starts.append(Path(text_path).resolve())
+            except (OSError, RuntimeError):
+                pass
     starts.append(Path.cwd().resolve())
     visited = set()
     for start in starts:
@@ -134,6 +446,22 @@ def _default_project_root():
     return str(candidate) if candidate is not None else ""
 
 
+def _ensure_project_root(settings):
+    """Populate an empty/stale scene path from the active GraSPH installation."""
+    current = str(getattr(settings, "project_root", "") or "").strip()
+    if current:
+        try:
+            if (_path(current) / "grasph.py").is_file():
+                return _path(current)
+        except (OSError, RuntimeError, ValueError):
+            pass
+    discovered = _discover_project_root()
+    if discovered is not None:
+        settings.project_root = str(discovered)
+        return discovered
+    return None
+
+
 def _path(value):
     # Do not let Blender resolve // against its installation/current-working
     # directory. A saved blend owns relative paths; an unsaved blend falls
@@ -146,6 +474,15 @@ def _path(value):
         relative = str(value)[2:].replace("/", os.sep).replace("\\", os.sep)
         return (base / relative).resolve()
     return Path(bpy.path.abspath(value)).resolve()
+
+
+def _npz_end_time(path, fallback):
+    try:
+        import numpy as np
+        with np.load(path, allow_pickle=False) as result:
+            return float(result["times"][-1])
+    except (OSError, ImportError, KeyError, ValueError, IndexError):
+        return float(fallback)
 
 
 def _tagged_objects(scene):
@@ -310,8 +647,13 @@ def validate_scene(scene):
     tagged = _tagged_objects(scene)
     fluid_objects = [obj for obj in tagged if obj.grasph.role == "FLUID"]
     granular_objects = [obj for obj in tagged if obj.grasph.role == "GRANULAR_SOURCE"]
-    if not fluid_objects and not granular_objects:
-        errors.append("No Fluid Volume or Granular Source is assigned.")
+    dynamic_objects = [obj for obj in tagged if obj.grasph.role in {
+        "DYNAMIC_HINGE", "DYNAMIC_BODY"
+    }]
+    if not fluid_objects and not granular_objects and not dynamic_objects:
+        errors.append(
+            "Assign a Fluid Volume, Granular Source, or moving rigid body to simulate."
+        )
     if fluid_objects and granular_objects:
         warnings.append(
             "Mixed fluid/granular mode enabled: grains use buoyancy and drag "
@@ -371,6 +713,13 @@ def validate_scene(scene):
 
     for obj in tagged:
         settings = obj.grasph
+        if settings.role == "JOINT":
+            if obj.type != "EMPTY":
+                errors.append(f"{obj.name}: Joint Anchor must be an Empty.")
+            body = settings.joint_body1
+            if body is None or body.grasph.role != "DYNAMIC_BODY":
+                errors.append(f"{obj.name}: assign one Dynamic Body to this joint.")
+            continue
         if obj.type != "MESH":
             errors.append(f"{obj.name}: role {settings.role} requires a mesh object.")
         if settings.role == "DYNAMIC_HINGE":
@@ -403,6 +752,18 @@ def validate_scene(scene):
         if settings.role == "KINEMATIC" and not obj.animation_data:
             warnings.append(f"{obj.name}: kinematic collider has no object animation.")
 
+    constrained_bodies = {}
+    for joint_obj in (obj for obj in tagged if obj.grasph.role == "JOINT"):
+        body = joint_obj.grasph.joint_body1
+        if body is None:
+            continue
+        if body.name in constrained_bodies:
+            errors.append(
+                f"{body.name}: only one joint anchor per body is supported "
+                f"({constrained_bodies[body.name]} and {joint_obj.name})."
+            )
+        constrained_bodies[body.name] = joint_obj.name
+
     if not any(obj.grasph.role in {"STATIC", "KINEMATIC", "DYNAMIC_HINGE", "DYNAMIC_BODY"}
                for obj in tagged):
         warnings.append("No colliders are explicitly assigned.")
@@ -424,7 +785,7 @@ def _matching_xform(stage, object_name):
 def _author_usd_physics(stage, objects, scene):
     """Add portable rigid-body semantics without replacing GraSPH metadata."""
     from mathutils import Vector
-    from pxr import Gf, Tf, Usd, UsdGeom, UsdPhysics, UsdShade
+    from pxr import Gf, Sdf, Tf, Usd, UsdGeom, UsdPhysics, UsdShade
 
     physics_root = stage.DefinePrim("/root/_GraSPHPhysics", "Scope")
     physics_scene = UsdPhysics.Scene.Define(stage, physics_root.GetPath().AppendChild("Scene"))
@@ -513,9 +874,87 @@ def _author_usd_physics(stage, objects, scene):
         ))
         joint.CreateCollisionEnabledAttr(False)
 
+    bodies_with_world_joint = set()
+    for obj in objects:
+        settings = obj.grasph
+        if settings.role != "JOINT":
+            continue
+        body = settings.joint_body1
+        if body is None or body.grasph.role != "DYNAMIC_BODY":
+            continue
+        body_prim = _matching_xform(stage, body.name)
+        if body_prim is None:
+            raise RuntimeError(
+                f"Joint {obj.name!r} cannot find its body {body.name!r} in exported USD"
+            )
+        kind = settings.joint_type
+        anchor = obj.matrix_world.translation.copy()
+        axis_local = Vector({
+            "X": (1.0, 0.0, 0.0), "Y": (0.0, 1.0, 0.0),
+            "Z": (0.0, 0.0, 1.0),
+        }[settings.joint_axis])
+        axis_world = obj.matrix_world.to_3x3() @ axis_local
+        if axis_world.length > 1.0e-12:
+            axis_world.normalize()
+        for prim in (body_prim, *[p for p in Usd.PrimRange(body_prim)
+                                  if p.IsA(UsdGeom.Mesh)]):
+            prim.CreateAttribute(
+                "grasph:jointType", Sdf.ValueTypeNames.String
+            ).Set(kind.lower())
+            prim.CreateAttribute(
+                "grasph:jointAxis", Sdf.ValueTypeNames.Double3
+            ).Set(Gf.Vec3d(*map(float, axis_world)))
+            prim.CreateAttribute(
+                "grasph:jointAnchor", Sdf.ValueTypeNames.Double3
+            ).Set(Gf.Vec3d(*map(float, anchor)))
+        if kind == "FREE":
+            continue
+        if body.name in bodies_with_world_joint:
+            raise RuntimeError(
+                f"Dynamic Body {body.name!r} has multiple world joints; "
+                "this solver supports one constraint per body"
+            )
+        bodies_with_world_joint.add(body.name)
+
+        joint_path = joints_root.GetPath().AppendChild(
+            Tf.MakeValidIdentifier(obj.name + "_" + kind.title() + "Joint")
+        )
+        if kind == "REVOLUTE":
+            joint = UsdPhysics.RevoluteJoint.Define(stage, joint_path)
+            joint.CreateAxisAttr(getattr(UsdPhysics.Tokens, settings.joint_axis.lower()))
+        elif kind == "PRISMATIC":
+            joint = UsdPhysics.PrismaticJoint.Define(stage, joint_path)
+            joint.CreateAxisAttr(getattr(UsdPhysics.Tokens, settings.joint_axis.lower()))
+        elif kind == "FIXED":
+            joint = UsdPhysics.FixedJoint.Define(stage, joint_path)
+        else:
+            raise RuntimeError(f"Unsupported GraSPH joint type: {kind}")
+
+        joint.CreateBody1Rel().SetTargets([body_prim.GetPath()])
+        joint_rotation = obj.matrix_world.to_quaternion()
+        body_rotation = body.matrix_world.to_quaternion()
+        body_local_anchor = body.matrix_world.inverted() @ anchor
+        body_local_rotation = body_rotation.inverted() @ joint_rotation
+        joint.CreateLocalPos0Attr(Gf.Vec3f(*map(float, anchor)))
+        joint.CreateLocalPos1Attr(Gf.Vec3f(*map(float, body_local_anchor)))
+        # The conversion uses the quaternion's scalar/vector components, not
+        # Euler angles; localRot1 preserves the anchor frame on the body.
+        joint.CreateLocalRot0Attr(Gf.Quatf(
+            float(joint_rotation.w),
+            Gf.Vec3f(float(joint_rotation.x), float(joint_rotation.y),
+                     float(joint_rotation.z)),
+        ))
+        joint.CreateLocalRot1Attr(Gf.Quatf(
+            float(body_local_rotation.w),
+            Gf.Vec3f(float(body_local_rotation.x), float(body_local_rotation.y),
+                     float(body_local_rotation.z)),
+        ))
+        joint.CreateCollisionEnabledAttr(False)
+
 
 def author_grasph_metadata(usd_path, objects, scene=None):
     """Write simulation semantics into the exported USD layer."""
+    from mathutils import Vector
     from pxr import Gf, Sdf, Usd, UsdGeom
 
     stage = Usd.Stage.Open(str(usd_path))
@@ -535,6 +974,40 @@ def author_grasph_metadata(usd_path, objects, scene=None):
         role = ROLE_TO_USD[settings.role]
         for prim in targets:
             prim.CreateAttribute("grasph:role", Sdf.ValueTypeNames.String).Set(role)
+
+        if settings.role == "JOINT":
+            body = settings.joint_body1
+            if body is None:
+                continue
+            body_owner = _matching_xform(stage, body.name)
+            if body_owner is None:
+                raise RuntimeError(
+                    f"Joint {obj.name!r} cannot find its Dynamic Body {body.name!r}"
+                )
+            axis_local = Vector({
+                "X": (1.0, 0.0, 0.0), "Y": (0.0, 1.0, 0.0),
+                "Z": (0.0, 0.0, 1.0),
+            }[settings.joint_axis])
+            axis_world = obj.matrix_world.to_3x3() @ axis_local
+            if axis_world.length > 1.0e-12:
+                axis_world.normalize()
+            anchor = obj.matrix_world.translation
+            body_targets = [body_owner]
+            body_targets.extend(
+                prim for prim in Usd.PrimRange(body_owner)
+                if prim.IsA(UsdGeom.Mesh)
+            )
+            for prim in body_targets:
+                prim.CreateAttribute(
+                    "grasph:jointType", Sdf.ValueTypeNames.String
+                ).Set(settings.joint_type.lower())
+                prim.CreateAttribute(
+                    "grasph:jointAxis", Sdf.ValueTypeNames.Double3
+                ).Set(Gf.Vec3d(*map(float, axis_world)))
+                prim.CreateAttribute(
+                    "grasph:jointAnchor", Sdf.ValueTypeNames.Double3
+                ).Set(Gf.Vec3d(*map(float, anchor)))
+            continue
 
         if settings.role in {"STATIC", "KINEMATIC", "DYNAMIC_HINGE", "DYNAMIC_BODY"}:
             for prim in targets:
@@ -691,6 +1164,20 @@ class GraSPHObjectSettings(PropertyGroup):
         name="Max Angular Speed", description="rad/s; zero disables the limit",
         default=40.0, min=0.0,
     )
+    joint_type: EnumProperty(
+        name="Joint Type", items=JOINT_TYPE_ITEMS, default="PRISMATIC",
+    )
+    joint_axis: EnumProperty(
+        name="Joint Axis",
+        items=(("X", "X", "Local X axis"), ("Y", "Y", "Local Y axis"),
+               ("Z", "Z", "Local Z axis")),
+        default="Z",
+    )
+    joint_body1: PointerProperty(
+        name="Dynamic Body", type=bpy.types.Object,
+        description="Rigid body connected to this world-anchored joint",
+        poll=lambda self, obj: obj.grasph.role == "DYNAMIC_BODY",
+    )
     collider_friction: FloatProperty(
         name="Surface Friction", description="Collider Coulomb friction coefficient",
         default=0.45, min=0.0, max=2.0,
@@ -790,11 +1277,60 @@ class GraSPHSceneSettings(PropertyGroup):
         description="External Python command containing the GraSPH dependencies",
     )
     sim_time: FloatProperty(name="Time (s)", default=1.0, min=1.0e-6)
+    restart_npz: StringProperty(
+        name="Continue From", subtype="FILE_PATH", default="",
+        description="Saved fluid result (.npz); choose a saved frame to continue from",
+    )
+    continue_from_result: BoolProperty(
+        name="Continue From Saved Fluid", default=False,
+        description="Resume a fluid-only NPZ result instead of starting a fresh simulation",
+    )
+    restart_time: FloatProperty(
+        name="Resume At (s)", default=0.0, min=0.0, precision=3,
+        description="Scene time of the saved frame to continue from",
+    )
     dp: FloatProperty(name="Particle Spacing (m)", default=0.05, min=1.0e-6)
     c0: FloatProperty(name="Sound Speed (m/s)", default=20.0, min=1.0e-6)
     output_fps: FloatProperty(name="Output FPS", default=30.0, min=0.1)
     output_dir: StringProperty(name="Output Folder", subtype="DIR_PATH", default="//output")
     output_name: StringProperty(name="Result Name", default="grasph_result")
+    new_joint_type: EnumProperty(
+        name="Joint Type", items=JOINT_TYPE_ITEMS, default="PRISMATIC",
+    )
+    live_preview: BoolProperty(
+        name="Live Viewport Preview", default=True,
+        description="Stream fluid/grain snapshots into Blender while the external solver runs",
+    )
+    live_preview_interval: bpy.props.IntProperty(
+        name="Preview Every (%)", default=5, min=1, max=100,
+        description="Publish a viewport update at each percentage of simulated time",
+    )
+    live_grain_radius: FloatProperty(
+        name="Preview Grain Radius", default=0.005, min=1.0e-5,
+        description="Visual grain radius for the live viewport preview",
+    )
+    write_usd_checkpoints: BoolProperty(
+        name="Write Partial USD Checkpoints", default=False,
+        description=(
+            "Write an atomically replaced partial USDC during the run; adds disk I/O"
+        ),
+    )
+    usd_checkpoint_interval: bpy.props.IntProperty(
+        name="Checkpoint Every (%)", default=10, min=1, max=100,
+        description="Update the partial USDC after this much simulated time",
+    )
+    live_preview_progress: FloatProperty(
+        name="Preview Progress", default=0.0, min=0.0, max=100.0,
+        options={"SKIP_SAVE"},
+    )
+    live_preview_time: FloatProperty(
+        name="Preview Time", default=0.0, min=0.0, options={"SKIP_SAVE"},
+    )
+    collider_display: EnumProperty(
+        name="Collider Display", items=_COLLIDER_DISPLAY_ITEMS, default="OFF",
+        update=_set_collider_outlines,
+        description="Visual-only collider overlays; simulation geometry is unchanged",
+    )
     result_usd: StringProperty(name="Last Result", subtype="FILE_PATH")
     log_file: StringProperty(name="Last Log", subtype="FILE_PATH")
     last_input_usd: StringProperty(
@@ -843,6 +1379,14 @@ class GraSPHSceneSettings(PropertyGroup):
         name="Droplet Neighbors", default=0, min=0,
         description="Legacy cutoff used by Low Neighbor Count mode",
     )
+    droplet_drag_cd: FloatProperty(
+        name="Droplet Air Drag (Cd)", default=0.47, min=0.0, max=2.0,
+        precision=2,
+        description=(
+            "Quadratic air drag for detached fluid only; equivalent-sphere model. "
+            "Set to 0 to disable"
+        ),
+    )
     wall_search: EnumProperty(
         name="Wall Search",
         items=(("cached", "Cached", "Reuse translated-collider search trees"),
@@ -868,6 +1412,9 @@ class GraSPHSceneSettings(PropertyGroup):
     )
     run_status: StringProperty(
         name="Run Status", default="Idle", options={"SKIP_SAVE"},
+    )
+    pause_file: StringProperty(
+        name="Pause Control", default="", options={"HIDDEN", "SKIP_SAVE"},
     )
     run_message: StringProperty(
         name="Solver Message", default="", options={"SKIP_SAVE"},
@@ -917,6 +1464,47 @@ class GRASPH_OT_quality_preset(Operator):
         return {"FINISHED"}
 
 
+class GRASPH_OT_resume_current_frame(Operator):
+    bl_idname = "grasph.resume_current_frame"
+    bl_label = "Use Current Frame"
+    bl_description = "Set the resume time from the current Blender timeline frame"
+
+    def execute(self, context):
+        settings = context.scene.grasph_scene
+        fps = max(float(settings.output_fps), 1.0e-6)
+        settings.restart_time = max(
+            0.0, (context.scene.frame_current - context.scene.frame_start) / fps
+        )
+        return {"FINISHED"}
+
+
+class GRASPH_OT_add_joint_anchor(Operator):
+    bl_idname = "grasph.add_joint_anchor"
+    bl_label = "Add Joint Anchor"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        body = context.active_object
+        if body is not None and body.grasph.role != "DYNAMIC_BODY":
+            body = None
+        bpy.ops.object.empty_add(
+            type="ARROWS", align="WORLD", location=context.scene.cursor.location
+        )
+        anchor = context.active_object
+        anchor.name = "GraSPH_Joint"
+        anchor.empty_display_size = 0.35
+        anchor.show_in_front = True
+        anchor.color = (0.20, 0.95, 0.45, 1.0)
+        anchor.grasph.role = "JOINT"
+        anchor.grasph.joint_type = context.scene.grasph_scene.new_joint_type
+        anchor.grasph.joint_body1 = body
+        self.report(
+            {"INFO"},
+            "Joint anchor added at the 3D Cursor; move/rotate it to place the joint",
+        )
+        return {"FINISHED"}
+
+
 class GRASPH_OT_granular_material_preset(Operator):
     bl_idname = "grasph.granular_material_preset"
     bl_label = "Apply Material Preset"
@@ -948,7 +1536,8 @@ class GRASPH_OT_validate(Operator):
     def execute(self, context):
         errors, warnings = validate_scene(context.scene)
         unassigned = [obj.name for obj in context.scene.objects
-                      if obj.type == "MESH" and obj.grasph.role == "NONE"]
+                      if obj.type == "MESH" and obj.grasph.role == "NONE"
+                      and not obj.get("grasph:collider_outline")]
         if unassigned:
             warnings.append(
                 f"{len(unassigned)} unassigned mesh object(s) will be excluded from export."
@@ -995,20 +1584,49 @@ class GRASPH_OT_run(Operator):
     _log_handle = None
     _started_at = 0.0
     _last_log_size = 0
+    _last_preview_mtime = 0.0
+    _run_final_time = 0.0
 
     def execute(self, context):
         global _RUNNING
-        if _RUNNING is not None and _RUNNING.poll() is None:
-            self.report({"ERROR"}, "A GraSPH simulation is already running")
+        if _RUNNING is not None:
+            self.report({"ERROR"}, "Wait for the current simulation to finish or reset")
             return {"CANCELLED"}
         settings = context.scene.grasph_scene
-        root = _path(settings.project_root)
+        root = _ensure_project_root(settings)
+        if root is None:
+            self.report(
+                {"ERROR"},
+                "GraSPH project folder was not detected. Choose the folder containing grasph.py.",
+            )
+            return {"CANCELLED"}
         solver = root / "grasph.py"
         output_dir = _path(settings.output_dir)
         if not solver.is_file():
             self.report({"ERROR"}, f"grasph.py not found under {root}")
             return {"CANCELLED"}
         output_dir.mkdir(parents=True, exist_ok=True)
+        restart_npz = (
+            _path(settings.restart_npz)
+            if settings.continue_from_result and settings.restart_npz else None
+        )
+        if settings.continue_from_result and restart_npz is None:
+            self.report({"ERROR"}, "Choose a saved fluid result (.npz) to continue from")
+            return {"CANCELLED"}
+        if restart_npz and not restart_npz.is_file():
+            self.report({"ERROR"}, f"Restart result not found: {restart_npz}")
+            return {"CANCELLED"}
+        result_stem = settings.output_name
+        if restart_npz and restart_npz.resolve() == (output_dir / (result_stem + ".npz")).resolve():
+            base_stem = result_stem + "_continued"
+            result_stem = base_stem
+            suffix = 2
+            while (output_dir / (result_stem + ".npz")).exists():
+                result_stem = f"{base_stem}_{suffix}"
+                suffix += 1
+            settings.output_name = result_stem
+            self.report({"INFO"}, f"Saving continuation as {result_stem} to preserve the source result")
+        self._run_final_time = (settings.restart_time if restart_npz else 0.0) + settings.sim_time
         if settings.auto_export:
             errors, warnings = validate_scene(context.scene)
             if errors:
@@ -1033,8 +1651,21 @@ class GRASPH_OT_run(Operator):
             settings.last_input_usd = str(source)
         log_file = output_dir / (settings.output_name + ".log")
         result_usd = output_dir / (settings.output_name + ".usdc")
+        checkpoint_usd = output_dir / (settings.output_name + "_checkpoint.usdc")
+        preview_file = output_dir / (settings.output_name + "_live_preview.npz")
+        pause_file = output_dir / (settings.output_name + ".pause")
+        pause_file.unlink(missing_ok=True)
+        _prepare_live_preview_for_run(context.scene, preview_file)
+        if settings.write_usd_checkpoints:
+            checkpoint_usd.unlink(missing_ok=True)
+        settings.pause_file = str(pause_file)
+        self._last_preview_mtime = 0.0
         settings.log_file = str(log_file)
-        settings.result_usd = str(result_usd)
+        settings.result_usd = str(
+            checkpoint_usd if settings.write_usd_checkpoints else result_usd
+        )
+        settings.live_preview_progress = 0.0
+        settings.live_preview_time = 0.0
         settings.run_progress = 0.0
         settings.run_status = "Starting"
         settings.run_message = "Launching external solver…"
@@ -1052,10 +1683,28 @@ class GRASPH_OT_run(Operator):
             "--threads", str(settings.threads),
             "--droplet-mode", settings.droplet_mode,
             "--droplet-neighbors", str(settings.droplet_neighbors),
+            "--droplet-drag-cd", str(settings.droplet_drag_cd),
             "--wall-search", settings.wall_search,
             "--granular-dt", str(settings.granular_dt),
             "--granular-iterations", str(settings.granular_iterations),
+            "--control-file", str(pause_file),
         ]
+        if restart_npz:
+            command.extend([
+                "--restart-npz", str(restart_npz),
+                "--restart-time", str(settings.restart_time),
+            ])
+        if settings.write_usd_checkpoints:
+            command.extend([
+                "--usd-checkpoint", str(checkpoint_usd),
+                "--usd-checkpoint-interval",
+                str(settings.usd_checkpoint_interval / 100.0),
+            ])
+        if settings.live_preview:
+            command.extend([
+                "--preview-file", str(preview_file),
+                "--preview-interval", str(settings.live_preview_interval / 100.0),
+            ])
         if not settings.enable_collision:
             command.append("--no-collision")
         if not settings.enable_wall_pressure:
@@ -1091,7 +1740,7 @@ class GRASPH_OT_run(Operator):
         return {"RUNNING_MODAL"}
 
     def modal(self, context, event):
-        global _RUNNING
+        global _RUNNING, _RESET_REQUESTED
         if event.type == "ESC":
             if _RUNNING and _RUNNING.poll() is None:
                 context.scene.grasph_scene.run_status = "Stopping"
@@ -1103,6 +1752,7 @@ class GRASPH_OT_run(Operator):
         if event.type != "TIMER":
             return {"PASS_THROUGH"}
         settings = context.scene.grasph_scene
+        pause_requested = bool(settings.pause_file and Path(settings.pause_file).is_file())
         elapsed = max(0, int(time.monotonic() - self._started_at))
         settings.run_elapsed = f"{elapsed // 60:02d}:{elapsed % 60:02d}"
         progress, message, log_size = _tail_solver_log(settings.log_file)
@@ -1110,18 +1760,47 @@ class GRASPH_OT_run(Operator):
             settings.run_progress = progress
         if message:
             settings.run_message = message
+        if settings.live_preview:
+            preview_file = _path(settings.output_dir) / (
+                settings.output_name + "_live_preview.npz"
+            )
+            try:
+                modified = preview_file.stat().st_mtime
+            except OSError:
+                modified = 0.0
+            if modified > self._last_preview_mtime:
+                updated = _update_live_preview(context.scene, preview_file)
+                if updated is not None:
+                    self._last_preview_mtime = modified
+                    settings.run_message = (
+                        f"Live preview: {updated[0] * 100:.0f}% · "
+                        f"t={updated[1]:.3f}s"
+                    )
         if log_size > self._last_log_size and settings.run_status != "Stopping":
             settings.run_status = "Running · log active"
             self._last_log_size = log_size
+        if pause_requested:
+            settings.run_status = "Paused"
         _tag_redraw(context)
         if _RUNNING is None or _RUNNING.poll() is None:
             return {"PASS_THROUGH"}
         return_code = _RUNNING.returncode
         was_stopping = settings.run_status == "Stopping"
+        was_resetting = _RESET_REQUESTED or settings.run_status == "Resetting"
         self._finish(context)
+        if was_resetting:
+            _RESET_REQUESTED = False
+            _reset_run_state(context.scene)
+            return {"CANCELLED"}
         if return_code == 0:
             settings.run_progress = 100.0
             settings.run_status = "Complete"
+            result_npz = _path(settings.output_dir) / (settings.output_name + ".npz")
+            settings.restart_npz = str(result_npz)
+            settings.restart_time = _npz_end_time(result_npz, self._run_final_time)
+            settings.result_usd = str(
+                _path(settings.output_dir) / (settings.output_name + ".usdc")
+            )
             self.report({"INFO"}, "Simulation complete")
             return {"FINISHED"}
         if was_stopping:
@@ -1155,6 +1834,51 @@ class GRASPH_OT_stop(Operator):
         context.scene.grasph_scene.run_status = "Stopping"
         _RUNNING.terminate()
         self.report({"WARNING"}, "Stopping simulation…")
+        return {"FINISHED"}
+
+
+class GRASPH_OT_toggle_pause(Operator):
+    bl_idname = "grasph.toggle_pause"
+    bl_label = "Pause Simulation"
+
+    def execute(self, context):
+        if _RUNNING is None or _RUNNING.poll() is not None:
+            self.report({"INFO"}, "No active GraSPH simulation")
+            return {"CANCELLED"}
+        settings = context.scene.grasph_scene
+        if not settings.pause_file:
+            self.report({"ERROR"}, "Simulation has no pause control file")
+            return {"CANCELLED"}
+        pause_file = Path(settings.pause_file)
+        if pause_file.exists():
+            pause_file.unlink(missing_ok=True)
+            settings.run_status = "Running"
+        else:
+            pause_file.parent.mkdir(parents=True, exist_ok=True)
+            pause_file.touch()
+            settings.run_status = "Pausing"
+        _tag_redraw(context)
+        return {"FINISHED"}
+
+
+class GRASPH_OT_reset_run(Operator):
+    bl_idname = "grasph.reset_simulation"
+    bl_label = "Reset Simulation"
+
+    def execute(self, context):
+        global _RESET_REQUESTED
+        settings = context.scene.grasph_scene
+        if _RUNNING is not None:
+            _RESET_REQUESTED = True
+            settings.run_status = "Resetting"
+            if settings.pause_file:
+                Path(settings.pause_file).unlink(missing_ok=True)
+            if _RUNNING.poll() is None:
+                _RUNNING.terminate()
+            self.report({"WARNING"}, "Stopping and resetting simulation...")
+            return {"FINISHED"}
+        _reset_run_state(context.scene)
+        self.report({"INFO"}, "Simulation reset; ready to start from the beginning")
         return {"FINISHED"}
 
 
@@ -1268,6 +1992,9 @@ class GRASPH_PT_entities(Panel):
     bl_region_type = "UI"
     bl_category = "GraSPH"
 
+    def draw_header(self, context):
+        self.layout.label(text="", icon="OBJECT_DATA")
+
     def draw(self, context):
         layout = self.layout
         obj = context.active_object
@@ -1278,7 +2005,17 @@ class GRASPH_PT_entities(Panel):
         layout.label(text=obj.name, icon="OBJECT_DATA")
         layout.prop(settings, "role")
         layout.operator("grasph.assign_selected")
-        if settings.role == "DYNAMIC_HINGE":
+        if settings.role == "JOINT":
+            box = layout.box()
+            box.label(text="World-Anchored Joint")
+            box.prop(settings, "joint_type")
+            box.prop(settings, "joint_body1")
+            if settings.joint_type in {"REVOLUTE", "PRISMATIC"}:
+                box.prop(settings, "joint_axis", expand=True)
+            box.label(text="Move/rotate this Empty to place its anchor", icon="ORIENTATION_GIMBAL")
+            if settings.joint_type == "FREE":
+                box.label(text="Free: this body has no joint constraint", icon="INFO")
+        elif settings.role == "DYNAMIC_HINGE":
             box = layout.box()
             box.label(text="Dynamic Axle")
             box.prop(settings, "axis", expand=True)
@@ -1338,6 +2075,10 @@ class GRASPH_PT_simulation(Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "GraSPH"
+    bl_order = 0
+
+    def draw_header(self, context):
+        self.layout.label(text="", icon="PHYSICS")
 
     def draw(self, context):
         layout = self.layout
@@ -1350,74 +2091,58 @@ class GRASPH_PT_simulation(Panel):
 
         summary = scene_summary(context.scene)
         summary_box = layout.box()
-        summary_box.label(text="Scene Summary")
+        summary_box.label(text="Scene at a Glance")
         row = summary_box.row(align=True)
-        row.label(text=f"Fluid: {summary['fluid_particles']:,}")
-        row.label(text=f"Grains: {summary['grain_particles']:,}")
+        row.label(text=f"Fluid: {summary['fluid_particles']:,}", icon="MOD_FLUID")
+        row.label(text=f"Grains: {summary['grain_particles']:,}", icon="PARTICLES")
         row = summary_box.row(align=True)
         row.label(text=f"Colliders: {summary['colliders']}")
-        row.label(text=f"Dynamic: {summary['dynamic']}")
-        coupling = "Mixed coupling ON" if summary["mixed"] else "Single phase"
+        row.label(text=f"Moving bodies: {summary['dynamic']}")
+        if summary["mixed"]:
+            coupling = "Fluid + grains"
+        elif not summary["fluid_sources"] and not summary["granular_sources"]:
+            coupling = "Rigid bodies only"
+        elif summary["fluid_sources"]:
+            coupling = "Fluid"
+        else:
+            coupling = "Granular"
         summary_box.label(
-            text=f"{summary['workload']} workload · ~{summary['memory_mb']:.1f} MB · {coupling}"
+            text=f"Estimated {summary['workload'].lower()} workload, "
+                 f"about {summary['memory_mb']:.1f} MB · {coupling}"
         )
-        errors, warnings = validate_scene(context.scene)
-        for message in errors[:2]:
-            summary_box.label(text=message[:100], icon="ERROR")
-        for message in warnings[:3]:
-            summary_box.label(text=message[:100], icon="INFO")
 
-        layout.prop(settings, "project_root")
-        layout.prop(settings, "auto_export")
-        layout.prop(settings, "author_usd_physics")
-        if settings.author_usd_physics:
-            layout.label(text="USD Physics schemas will be authored", icon="CHECKMARK")
-        source_row = layout.row()
-        source_row.enabled = not settings.auto_export
-        source_row.prop(settings, "usd_file")
-        row = layout.row(align=True)
-        row.operator("grasph.validate_scene")
-        export_row = row.row(align=True)
-        export_row.enabled = not settings.auto_export
-        export_row.operator("grasph.export_usd")
-        preset_box = layout.box()
+        running = _RUNNING is not None
+        physics_box = layout.box()
+        physics_box.label(text="Simulation", icon="PHYSICS")
+        physics_box.enabled = not running
+        physics_box.prop(
+            settings, "sim_time",
+            text="Additional Time (s)" if settings.continue_from_result else "Time (s)",
+        )
+        physics_box.prop(settings, "continue_from_result")
+        if settings.continue_from_result:
+            physics_box.prop(settings, "restart_npz")
+            physics_box.prop(settings, "restart_time")
+            physics_box.operator("grasph.resume_current_frame", icon="TIME")
+            physics_box.label(
+                text="Fluid resumes here; new bodies need Fluid / Solid Coupling enabled.",
+                icon="INFO",
+            )
+        physics_box.prop(settings, "dp")
+        physics_box.label(
+            text="Smaller spacing creates more particles and takes longer.",
+            icon="INFO",
+        )
+        preset_box = physics_box.box()
         preset_box.label(text="Quality Presets")
         row = preset_box.row(align=True)
         for preset, label in (("DRAFT", "Draft"), ("BALANCED", "Balanced"),
                               ("QUALITY", "Quality")):
             operator = row.operator("grasph.quality_preset", text=label)
             operator.preset = preset
-
-        box = layout.box()
-        box.label(text="Physics Resolution")
-        box.prop(settings, "sim_time")
-        box.prop(settings, "dp")
-        box.label(text="Smaller spacing = more particles and longer runtime", icon="INFO")
-        output_box = layout.box()
-        output_box.label(text="Output")
-        output_box.prop(settings, "output_fps")
-        output_box.prop(settings, "output_dir")
-        output_box.prop(settings, "output_name")
-        output_box.prop(settings, "python_command")
-        box.prop(settings, "show_advanced", toggle=True)
-        if settings.show_advanced:
-            advanced = box.column(align=True)
-            advanced.prop(settings, "c0")
-            advanced.prop(settings, "free_surface")
-            advanced.prop(settings, "enable_collision")
-            advanced.prop(settings, "enable_wall_pressure")
-            advanced.prop(settings, "enable_wall_continuity")
-            advanced.prop(settings, "enable_solid_coupling")
-            advanced.prop(settings, "neighbor_backend")
-            advanced.prop(settings, "threads")
-            advanced.prop(settings, "droplet_mode")
-            if settings.droplet_mode == "zero":
-                advanced.prop(settings, "droplet_neighbors")
-            advanced.prop(settings, "wall_search")
-            advanced.prop(settings, "granular_dt")
-            advanced.prop(settings, "granular_iterations")
-        running = _RUNNING is not None and _RUNNING.poll() is None
         if running:
+            box = layout.box()
+            box.label(text="Simulation Running", icon="TIME")
             status_text = (
                 f"{settings.run_status} · PID {settings.run_pid} · "
                 f"{settings.run_elapsed}"
@@ -1433,23 +2158,190 @@ class GRASPH_PT_simulation(Panel):
                 box.label(text=f"Progress: {settings.run_progress:.1f}%")
             if settings.run_message:
                 box.label(text=settings.run_message[:90], icon="CONSOLE")
-            box.operator("grasph.stop_simulation", icon="CANCEL")
+            control_row = box.row(align=True)
+            paused = bool(settings.pause_file and Path(settings.pause_file).is_file())
+            pause = control_row.operator(
+                "grasph.toggle_pause", text="Resume" if paused else "Pause",
+                icon="PLAY" if paused else "PAUSE",
+            )
+            control_row.operator("grasph.stop_simulation", text="Stop", icon="CANCEL")
+            box.operator("grasph.reset_simulation", text="Reset to Start", icon="FILE_REFRESH")
         else:
-            box.operator("grasph.run_simulation", icon="PLAY")
+            box = layout.box()
+            controls = box.row(align=True)
+            controls.operator("grasph.run_simulation", text="Run Simulation", icon="PLAY")
+            controls.operator("grasph.reset_simulation", text="Reset", icon="FILE_REFRESH")
             if settings.run_status != "Idle":
                 icon = "CHECKMARK" if settings.run_status == "Complete" else "INFO"
                 box.label(text=settings.run_status, icon=icon)
         row = layout.row(align=True)
-        row.operator("grasph.open_result", icon="IMPORT")
+        import_label = (
+            "Import Checkpoint" if running and settings.write_usd_checkpoints
+            else "Import Last Result"
+        )
+        row.operator("grasph.open_result", text=import_label, icon="IMPORT")
         row.operator("grasph.open_output_folder", icon="FILE_FOLDER")
         layout.prop(settings, "create_surface")
+
+
+class GRASPH_PT_project(Panel):
+    bl_label = "Project & Scene"
+    bl_idname = "GRASPH_PT_project"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "GraSPH"
+    bl_parent_id = "GRASPH_PT_simulation"
+    bl_order = 1
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw_header(self, context):
+        self.layout.label(text="", icon="FILE_FOLDER")
+
+    def draw(self, context):
+        settings = context.scene.grasph_scene
+        _ensure_project_root(settings)
+        layout = self.layout
+        layout.enabled = _RUNNING is None
+        layout.prop(settings, "project_root")
+        layout.prop(settings, "auto_export")
+        layout.prop(settings, "author_usd_physics")
+        if settings.author_usd_physics:
+            layout.label(text="USD Physics schemas will be authored", icon="CHECKMARK")
+        source_row = layout.row()
+        source_row.enabled = not settings.auto_export
+        source_row.prop(settings, "usd_file")
+        row = layout.row(align=True)
+        row.operator("grasph.validate_scene")
+        export_row = row.row(align=True)
+        export_row.enabled = not settings.auto_export
+        export_row.operator("grasph.export_usd")
+
+        joints = layout.box()
+        joints.label(text="Joint Placement", icon="EMPTY_AXIS")
+        joints.label(text="Creates an anchor at the 3D Cursor; move it to position the joint.")
+        row = joints.row(align=True)
+        row.prop(settings, "new_joint_type", text="")
+        row.operator("grasph.add_joint_anchor", text="Add Joint", icon="ADD")
+
+
+class GRASPH_PT_output_preview(Panel):
+    bl_label = "Output & Preview"
+    bl_idname = "GRASPH_PT_output_preview"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "GraSPH"
+    bl_parent_id = "GRASPH_PT_simulation"
+    bl_order = 2
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw_header(self, context):
+        self.layout.label(text="", icon="EXPORT")
+
+    def draw(self, context):
+        settings = context.scene.grasph_scene
+        layout = self.layout
+        running = _RUNNING is not None
+        output = layout.column()
+        output.enabled = not running
+        output.prop(settings, "output_fps")
+        output.prop(settings, "output_dir")
+        output.prop(settings, "output_name")
+        output.prop(settings, "python_command")
+
+        preview = layout.box()
+        preview.label(text="Live Viewport Preview", icon="VIEW_CAMERA")
+        live_row = preview.row()
+        live_row.enabled = not running
+        live_row.prop(settings, "live_preview")
+        if settings.live_preview:
+            row = preview.row(align=True)
+            row.enabled = not running
+            row.prop(settings, "live_preview_interval")
+            row.label(text="%")
+            grain_radius = preview.row()
+            grain_radius.enabled = not running
+            grain_radius.prop(settings, "live_grain_radius")
+            if settings.live_preview_time > 0.0:
+                preview.label(
+                    text=f"t={settings.live_preview_time:.3f}s · "
+                         f"{settings.live_preview_progress:.0f}%",
+                    icon="TIME",
+                )
+        checkpoint = preview.column()
+        checkpoint.enabled = not running
+        checkpoint.prop(settings, "write_usd_checkpoints")
+        if settings.write_usd_checkpoints:
+            checkpoint.prop(settings, "usd_checkpoint_interval")
         if settings.log_file:
             layout.label(text="Log: " + Path(settings.log_file).name, icon="TEXT")
         if settings.last_input_usd:
-            layout.label(
-                text="Input: " + Path(settings.last_input_usd).name,
-                icon="FILE_3D",
+            layout.label(text="Input: " + Path(settings.last_input_usd).name, icon="FILE_3D")
+
+
+class GRASPH_PT_advanced(Panel):
+    bl_label = "Advanced Solver Settings"
+    bl_idname = "GRASPH_PT_advanced"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "GraSPH"
+    bl_parent_id = "GRASPH_PT_simulation"
+    bl_order = 3
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw_header(self, context):
+        self.layout.label(text="", icon="PREFERENCES")
+
+    def draw(self, context):
+        settings = context.scene.grasph_scene
+        layout = self.layout
+        layout.enabled = _RUNNING is None
+        layout.prop(settings, "c0")
+        layout.prop(settings, "free_surface")
+        layout.prop(settings, "enable_collision")
+        layout.prop(settings, "enable_wall_pressure")
+        layout.prop(settings, "enable_wall_continuity")
+        layout.prop(settings, "enable_solid_coupling")
+        layout.prop(settings, "neighbor_backend")
+        layout.prop(settings, "threads")
+        layout.prop(settings, "droplet_mode")
+        if settings.droplet_mode == "zero":
+            layout.prop(settings, "droplet_neighbors")
+        layout.prop(settings, "droplet_drag_cd")
+        layout.prop(settings, "wall_search")
+        layout.prop(settings, "granular_dt")
+        layout.prop(settings, "granular_iterations")
+
+
+class GRASPH_PT_validation(Panel):
+    bl_label = "Scene Check"
+    bl_idname = "GRASPH_PT_validation"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "GraSPH"
+    bl_parent_id = "GRASPH_PT_simulation"
+    bl_order = 5
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw_header(self, context):
+        self.layout.label(text="", icon="CHECKMARK")
+
+    def draw(self, context):
+        layout = self.layout
+        errors, warnings = validate_scene(context.scene)
+        unassigned = [obj.name for obj in context.scene.objects
+                      if obj.type == "MESH" and obj.grasph.role == "NONE"
+                      and not obj.get("grasph:collider_outline")]
+        if unassigned:
+            warnings.append(
+                f"{len(unassigned)} unassigned mesh object(s) will be excluded from export."
             )
+        if not errors and not warnings:
+            layout.label(text="Scene looks ready to run.", icon="CHECKMARK")
+            return
+        for message in errors:
+            layout.label(text=message, icon="ERROR")
+        for message in warnings:
+            layout.label(text=message, icon="INFO")
 
 
 class GRASPH_PT_display(Panel):
@@ -1458,6 +2350,9 @@ class GRASPH_PT_display(Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "GraSPH"
+
+    def draw_header(self, context):
+        self.layout.label(text="", icon="MOD_FLUID")
 
     def draw(self, context):
         layout = self.layout
@@ -1479,12 +2374,36 @@ class GRASPH_PT_display(Panel):
             layout.prop(modifier, '["' + identifier + '"]', text=name)
 
 
+class GRASPH_PT_colliders(Panel):
+    bl_label = "GraSPH Colliders"
+    bl_idname = "GRASPH_PT_colliders"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "GraSPH"
+    bl_parent_id = "GRASPH_PT_simulation"
+    bl_order = 4
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw_header(self, context):
+        self.layout.label(text="", icon="MOD_PHYSICS")
+
+    def draw(self, context):
+        settings = context.scene.grasph_scene
+        self.layout.prop(settings, "collider_display")
+        self.layout.label(
+            text="Visual overlays only; excluded from simulation/export", icon="INFO"
+        )
+
+
 class GRASPH_PT_granular_display(Panel):
     bl_label = "GraSPH Granular Display"
     bl_idname = "GRASPH_PT_granular_display"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "GraSPH"
+
+    def draw_header(self, context):
+        self.layout.label(text="", icon="PARTICLES")
 
     def draw(self, context):
         layout = self.layout
@@ -1508,17 +2427,26 @@ CLASSES = (
     GraSPHSceneSettings,
     GRASPH_OT_assign_selected,
     GRASPH_OT_quality_preset,
+    GRASPH_OT_resume_current_frame,
+    GRASPH_OT_add_joint_anchor,
     GRASPH_OT_granular_material_preset,
     GRASPH_OT_validate,
     GRASPH_OT_export,
     GRASPH_OT_run,
     GRASPH_OT_stop,
+    GRASPH_OT_toggle_pause,
+    GRASPH_OT_reset_run,
     GRASPH_OT_open_output_folder,
     GRASPH_OT_open_result,
     GRASPH_OT_refresh_surface,
     GRASPH_OT_refresh_granular_display,
     GRASPH_PT_entities,
     GRASPH_PT_simulation,
+    GRASPH_PT_project,
+    GRASPH_PT_output_preview,
+    GRASPH_PT_advanced,
+    GRASPH_PT_colliders,
+    GRASPH_PT_validation,
     GRASPH_PT_display,
     GRASPH_PT_granular_display,
 )

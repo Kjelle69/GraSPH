@@ -7,10 +7,16 @@ Editor and choose **Run Script**. The 3D View sidebar then contains a **GraSPH**
 tab with entity, simulation and result-display panels:
 
 - **GraSPH Entities** assigns Fluid Volume, Granular Source, Sink, Static
-  Collider, Kinematic Collider, Dynamic Hinge or Visual Only to mesh objects.
+  Collider, Kinematic Collider, Dynamic Hinge, Dynamic Body, Joint Anchor or
+  Visual Only to scene objects.
 - **GraSPH Simulation** validates and exports a generic USDC, launches
   `grasph.py` as an external process, records a log beside the result and can
-  import the finished result back into Blender.
+  import the finished result back into Blender. While a run is active, its
+  controls can pause/resume the solver, stop it, or reset the live preview and
+  body transforms to their starting state. Saved result files are preserved.
+- **GraSPH Colliders** toggles viewport-only wire overlays for static,
+  kinematic and dynamic collider meshes. The overlays are render-hidden and
+  excluded from scene export.
 
 The simulation panel exposes time, particle spacing, output FPS/folder/name and
 an Advanced Settings section with sound speed, free-surface mode, collision,
@@ -18,13 +24,34 @@ wall pressure/continuity, neighbor backend and threads, droplet handling and
 wall-search mode. **Export Before Run** keeps the USDC synchronized with the
 current Blender scene. Press Escape while the modal run is active to stop it.
 
+**Live Viewport Preview** is enabled by default and updates at the selected
+simulation percentage (5% by default). GraSPH atomically publishes a compact
+checkpoint while the external solver runs; Blender updates one set of point
+instances and the simulated rigid-body transforms instead of importing a new
+USD file each time. This is a lightweight particle-state preview, not a rendered
+image or the final reconstructed water surface. Use **Import Last Result** when
+the run finishes for the full animated USD cache and normal surface controls.
+Optionally enable **Write Partial USD Checkpoints** to atomically update a
+separate `*_checkpoint.usdc` file every 10% (configurable). While the solver is
+running, **Import Checkpoint** targets the latest completed checkpoint; after
+completion it switches to **Import Last Result** and the final USDC. Checkpoint writes are disabled by
+default because repeatedly authoring USD can add noticeable disk I/O.
+
 For a dynamic hinge, place the Blender object origin at the axle center, select
 the world X/Y/Z axis and set inertia, damping and maximum angular speed. The
 export button writes the corresponding `grasph:*` attributes directly into the
 USDC. No scene-specific build script is involved.
 
-The first version supports axis-aligned world-space hinges. Fluid generators
-and arbitrary/standard USD Physics joint orientations are planned extensions.
+Use **Add Joint Anchor** in the simulation panel to create a visible Blender
+Empty at the 3D Cursor. Move and rotate it into place, select its type, and
+assign the Dynamic Body it constrains. **Revolute (Hinge)** permits rotation
+around its axis; **Prismatic (Linear)** permits translation along its axis;
+**Fixed** locks the body at its initial pose; **Free** leaves all degrees of
+freedom unconstrained. Anchors are world-attached and limited to one per body.
+Revolute, prismatic and fixed joints are authored as USD Physics joints, with
+GraSPH metadata used by the external solver. The current joint MVP constrains
+one body to the world; joints connecting two moving bodies are not yet
+supported. A body without an anchor is free by default.
 
 ## Granular volume and flow sources (v0.5.1)
 
@@ -54,9 +81,9 @@ current MVP uses the displayed **Collision Radius** as a spherical envelope for
 body-versus-environment contact; grains still collide against its actual mesh
 distance field. Result transforms are animated in the USD overlay.
 
-This milestone supports box volumes and box-shaped flow outlets. Arbitrary
-mesh-volume filling and two-way fluid/granular coupling are subsequent steps.
-A scene must currently contain fluid sources or granular sources, not both.
+Granular sources can be simulated alongside fluid volumes. Two-way fluid/solid
+coupling for Dynamic Body objects is independently selectable in Advanced
+Settings.
 
 ## Fluid surface preview
 

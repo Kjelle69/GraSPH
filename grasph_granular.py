@@ -13,14 +13,16 @@ import time
 import numpy as np
 
 from grasph_collision import build_colliders, resolve_collisions
-from grasph_output import save_npz, write_usd_animation
+from grasph_output import save_npz, write_usd_animation, write_usd_checkpoint
 from grasph_rigid import (
     advance_rotation as _advance_rotation,
     axis_angle_matrix as _axis_angle_matrix,
     resolve_body_contacts,
     rotation_to_euler_xyz as _rotation_to_euler_xyz,
     world_inertia,
+    constrain_body_state,
 )
+from grasph_runtime import wait_if_paused
 from grasph_scene import generate_granular_particles
 from grasph_sph import build_neighbor_pairs
 
@@ -205,9 +207,13 @@ def run_granular_simulation(usd_file, scene, settings, gravity=(0.0, 0.0, -9.81)
     pos, source_ids = generate_granular_particles(scene)
 
     sources = scene.granular_sources
+    source_radii = np.asarray([source.particle_radius for source in sources])
     flow_sources = [source for source in sources if source.source_mode == "flow"]
-    if len(pos) == 0 and not flow_sources:
-        raise RuntimeError("No granular particles or Granular Flow Source found.")
+    rigid_only = not sources and bool(scene.dynamic_bodies or scene.hinges)
+    if len(pos) == 0 and not flow_sources and not rigid_only:
+        raise RuntimeError(
+            "No granular particles, flow source, or moving rigid body found."
+        )
     radii = np.asarray([sources[i].particle_radius for i in source_ids], dtype=np.float64)
     density = np.asarray([sources[i].density for i in source_ids], dtype=np.float64)
     friction = np.asarray([sources[i].friction for i in source_ids], dtype=np.float64)
@@ -238,10 +244,15 @@ def run_granular_simulation(usd_file, scene, settings, gravity=(0.0, 0.0, -9.81)
     out_dir = Path(settings.output_dir)
     npz_output = out_dir / f"{stem}.npz"
     usd_output = out_dir / f"{stem}.usdc"
+    contact_scale = (
+        max(min(float(source.particle_radius) for source in sources), 1.0e-4)
+        if sources else 0.025
+    )
     colliders = build_colliders(
         scene,
-        voxel_size=max(min(float(source.particle_radius) for source in sources), 1.0e-4),
-        margin=2.5 * max(float(source.particle_radius) for source in sources),
+        voxel_size=contact_scale,
+        margin=(2.5 * contact_scale if rigid_only else
+                2.5 * max(float(source.particle_radius) for source in sources)),
     ) if scene.colliders else []
 
     hinge_states = {
@@ -266,6 +277,92 @@ def run_granular_simulation(usd_file, scene, settings, gravity=(0.0, 0.0, -9.81)
     frame_hinge_angles = []
     frame_body_translations = {path: [] for path in body_paths}
     frame_body_rotations = {path: [] for path in body_paths}
+    preview_interval = max(0.01, float(getattr(settings, "preview_interval", 0.05)))
+    next_preview = preview_interval
+
+    def write_preview(t):
+        nonlocal next_preview
+        preview_file = getattr(settings, "preview_file", "")
+        if not preview_file:
+            return
+        import os
+        preview_path = Path(preview_file)
+        preview_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = preview_path.with_name(preview_path.name + ".tmp")
+        with temporary.open("wb") as stream:
+            np.savez(
+                stream, time=np.asarray(float(t)), progress=np.asarray(
+                    min(1.0, max(0.0, float(t) / max(settings.sim_time, 1e-12)))
+                ), positions=np.empty((0, 3), dtype=np.float32),
+                velocity=np.empty((0, 3), dtype=np.float32),
+                granular_positions=np.asarray(pos, dtype=np.float32),
+                granular_velocity=np.asarray(velocity, dtype=np.float32),
+                granular_radii=np.asarray(radii, dtype=np.float32),
+                body_paths=np.asarray(body_paths, dtype="U512"),
+                body_translations=np.asarray([
+                    body_states[path]["translation"] for path in body_paths
+                ], dtype=np.float64),
+                body_rotations=np.asarray([
+                    _rotation_to_euler_xyz(body_states[path]["rotation"])
+                    for path in body_paths
+                ], dtype=np.float64).reshape((-1, 3)),
+                hinge_paths=np.asarray(hinge_paths, dtype="U512"),
+                hinge_angles=np.asarray([
+                    hinge_states[path]["angle"] for path in hinge_paths
+                ], dtype=np.float64),
+            )
+        os.replace(temporary, preview_path)
+        next_preview = (np.floor(float(t) / preview_interval + 1e-10) + 1.0) * preview_interval
+
+    checkpoint_interval = max(0.01, min(
+        1.0, float(getattr(settings, "usd_checkpoint_interval", 0.10))
+    ))
+    next_checkpoint = checkpoint_interval
+    output_width = (
+        2.0 * float(np.mean(source_radii)) if len(source_radii) else 0.01
+    )
+
+    def write_animation(output_file, checkpoint=False):
+        writer = write_usd_checkpoint if checkpoint else write_usd_animation
+        writer(
+            scene.stage, frame_positions, frame_times, settings.output_fps,
+            output_width, output_file,
+            source_start_time_code=scene.start_time_code,
+            source_tps=scene.time_codes_per_second,
+            frame_velocities=frame_velocity,
+            prim_path="/GraSPH_GranularResult",
+            particle_widths=output_width,
+            result_kind="rigid" if rigid_only else "granular",
+            hinge_frames={
+                path: {
+                    "driver_path": scene.hinges[path].driver_path,
+                    "axis": scene.hinges[path].axis,
+                    "angles": np.asarray(frame_hinge_angles)[:, index],
+                }
+                for index, path in enumerate(hinge_paths)
+            },
+            body_frames={
+                path: {
+                    "driver_path": scene.dynamic_bodies[path].driver_path,
+                    "translations": np.asarray(frame_body_translations[path]),
+                    "rotations": np.asarray(frame_body_rotations[path]),
+                }
+                for path in body_paths
+            },
+        )
+
+    def write_partial_checkpoint(t):
+        nonlocal next_checkpoint
+        checkpoint_file = getattr(settings, "usd_checkpoint_file", "")
+        if not checkpoint_file or t >= settings.sim_time - 1e-12:
+            return
+        progress = float(t) / max(float(settings.sim_time), 1e-12)
+        if progress + 1e-10 < next_checkpoint:
+            return
+        write_animation(checkpoint_file, checkpoint=True)
+        next_checkpoint = (
+            np.floor(progress / checkpoint_interval + 1e-10) + 1.0
+        ) * checkpoint_interval
 
     def snapshot(t):
         frame_positions.append(pos.copy())
@@ -283,6 +380,9 @@ def run_granular_simulation(usd_file, scene, settings, gravity=(0.0, 0.0, -9.81)
             frame_body_rotations[path].append(
                 _rotation_to_euler_xyz(body_states[path]["rotation"])
             )
+        if float(t) + 1e-12 >= next_preview or float(t) == 0.0:
+            write_preview(t)
+        write_partial_checkpoint(float(t))
 
     snapshot(0.0)
     output_interval = 1.0 / settings.output_fps
@@ -299,22 +399,26 @@ def run_granular_simulation(usd_file, scene, settings, gravity=(0.0, 0.0, -9.81)
     last_report = started
 
     print("\n========================================")
-    print("STARTING GRANULAR DEM/PBD")
+    print("STARTING RIGID BODY SIMULATION" if rigid_only else "STARTING GRANULAR DEM/PBD")
     print("========================================")
     print(f"Initial grains: {len(pos)}")
     print(f"Flow sources  : {len(flow_states)}")
-    source_radii = np.asarray([source.particle_radius for source in sources])
-    print(f"Radius range  : {source_radii.min():g} .. {source_radii.max():g} m")
+    if len(source_radii):
+        print(f"Radius range  : {source_radii.min():g} .. {source_radii.max():g} m")
+    if rigid_only:
+        print(f"Rigid bodies  : {len(body_states)} (no particle sources)")
     print(f"Time step max : {dt_limit:g} s")
     print(f"Iterations    : {iterations}\n")
 
     while t < settings.sim_time - 1.0e-15:
+        wait_if_paused(getattr(settings, "control_file", ""))
         dt = min(dt_limit, settings.sim_time - t)
         for path, state in body_states.items():
             body = scene.dynamic_bodies[path]
             state["velocity"] += gravity * dt
             state["velocity"] /= 1.0 + body.linear_damping * dt
             state["omega"] /= 1.0 + body.angular_damping * dt
+            constrain_body_state(body, state)
         motion_now = scene.collider_motion(t) if scene.colliders else {}
         motion_next = scene.collider_motion(t + dt) if scene.colliders else {}
         collider_velocities = {
@@ -384,7 +488,7 @@ def run_granular_simulation(usd_file, scene, settings, gravity=(0.0, 0.0, -9.81)
         )
         total_pair_contacts += pair_contacts
 
-        if settings.enable_collision and colliders:
+        if len(pos) and settings.enable_collision and colliders:
             # The first milestone uses the mean material response at walls;
             # per-source values remain available for the next contact model.
             wall_contacts, linear_impulses, angular_impulses = resolve_collisions(
@@ -416,6 +520,7 @@ def run_granular_simulation(usd_file, scene, settings, gravity=(0.0, 0.0, -9.81)
             state["omega"] += np.linalg.solve(
                 body_world_inertia, angular_impulses.get(path, np.zeros(3))
             )
+            constrain_body_state(body, state)
 
         body_contacts, body_reaction_angular = resolve_body_contacts(
             scene, colliders, body_states, motion_next, collider_velocities,
@@ -425,6 +530,7 @@ def run_granular_simulation(usd_file, scene, settings, gravity=(0.0, 0.0, -9.81)
         total_wall_contacts += body_contacts
 
         for path, state in body_states.items():
+            constrain_body_state(scene.dynamic_bodies[path], state)
             state["translation"] += state["velocity"] * dt
             state["rotation"] = _advance_rotation(
                 state["rotation"], state["omega"], dt
@@ -500,42 +606,15 @@ def run_granular_simulation(usd_file, scene, settings, gravity=(0.0, 0.0, -9.81)
         particle_radius=np.asarray([source.particle_radius for source in sources], dtype=np.float64),
         removed_count=np.asarray(removed, dtype=np.int32),
         source_file=np.asarray(str(usd_file)),
-        solver_kind=np.asarray("granular"),
+        solver_kind=np.asarray("rigid" if rigid_only else "granular"),
     )
-    print("\nWriting granular outputs...")
+    print("\nWriting rigid-body outputs..." if rigid_only else "\nWriting granular outputs...")
+    write_preview(t)
     save_npz(npz_output, **arrays)
-    # Current sources normally share a radius. Variable widths can be added
-    # once variable-radius emission is enabled; use the authored mean now.
-    output_width = 2.0 * float(np.mean(source_radii))
-    write_usd_animation(
-        scene.stage, frame_positions, frame_times, settings.output_fps,
-        output_width, usd_output,
-        source_start_time_code=scene.start_time_code,
-        source_tps=scene.time_codes_per_second,
-        frame_velocities=frame_velocity,
-        prim_path="/GraSPH_GranularResult",
-        particle_widths=output_width,
-        result_kind="granular",
-        hinge_frames={
-            path: {
-                "driver_path": scene.hinges[path].driver_path,
-                "axis": scene.hinges[path].axis,
-                "angles": np.asarray(frame_hinge_angles)[:, index],
-            }
-            for index, path in enumerate(hinge_paths)
-        },
-        body_frames={
-            path: {
-                "driver_path": scene.dynamic_bodies[path].driver_path,
-                "translations": np.asarray(frame_body_translations[path]),
-                "rotations": np.asarray(frame_body_rotations[path]),
-            }
-            for path in body_paths
-        },
-    )
+    write_animation(usd_output)
     elapsed = time.perf_counter() - started
     print("\n========================================")
-    print("GRANULAR SIMULATION COMPLETE")
+    print("RIGID-BODY SIMULATION COMPLETE" if rigid_only else "GRANULAR SIMULATION COMPLETE")
     print("========================================")
     print(f"Simulated time : {t:.6f} s")
     print(f"Steps          : {step}")

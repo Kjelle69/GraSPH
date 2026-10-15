@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
@@ -8,6 +9,7 @@ from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 from grasph_scene import load_scene, generate_granular_particles
 from grasph_solver import SolverSettings, run_simulation
 from grasph_sph import SPHConfig
+from grasph_rigid import constrain_body_state
 
 
 def _cube(stage, path, lo, hi, role):
@@ -32,6 +34,63 @@ def _cube(stage, path, lo, hi, role):
 
 
 class GranularTests(unittest.TestCase):
+    def test_dynamic_body_reads_joint_type_axis_and_anchor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source_file = Path(directory) / "prismatic.usda"
+            stage = Usd.Stage.CreateNew(str(source_file))
+            UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+            UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+            body = UsdGeom.Xform.Define(stage, "/Slider").GetPrim()
+            _cube(stage, "/Slider/Geom", (-0.1, -0.1, -0.1),
+                  (0.1, 0.1, 0.1), "collider")
+            for name, value_type, value in (
+                ("grasph:dynamicBodyEnabled", Sdf.ValueTypeNames.Bool, True),
+                ("grasph:bodyCenter", Sdf.ValueTypeNames.Double3, Gf.Vec3d(0.0)),
+                ("grasph:mass", Sdf.ValueTypeNames.Double, 1.0),
+                ("grasph:inertiaDiagonal", Sdf.ValueTypeNames.Double3, Gf.Vec3d(1.0)),
+                ("grasph:jointType", Sdf.ValueTypeNames.String, "prismatic"),
+                ("grasph:jointAxis", Sdf.ValueTypeNames.Double3, Gf.Vec3d(0.0, 1.0, 0.0)),
+                ("grasph:jointAnchor", Sdf.ValueTypeNames.Double3, Gf.Vec3d(0.0, 0.0, 0.5)),
+            ):
+                body.CreateAttribute(name, value_type).Set(value)
+            stage.GetRootLayer().Save()
+            scene = load_scene(source_file)
+            slider = next(iter(scene.dynamic_bodies.values()))
+            self.assertEqual(slider.joint_type, "prismatic")
+            np.testing.assert_allclose(slider.joint_axis, (0.0, 1.0, 0.0))
+            np.testing.assert_allclose(slider.joint_anchor, (0.0, 0.0, 0.5))
+
+    def test_prismatic_joint_projects_motion_to_its_axis(self):
+        body = SimpleNamespace(
+            path="/Slider", joint_type="prismatic",
+            joint_axis=np.asarray((0.0, 2.0, 0.0)),
+        )
+        state = {
+            "translation": np.asarray((1.0, 2.0, 3.0)),
+            "velocity": np.asarray((4.0, 5.0, 6.0)),
+            "rotation": np.eye(3),
+            "omega": np.asarray((0.1, 0.2, 0.3)),
+        }
+        constrain_body_state(body, state)
+        np.testing.assert_allclose(state["translation"], (0.0, 2.0, 0.0))
+        np.testing.assert_allclose(state["velocity"], (0.0, 5.0, 0.0))
+        np.testing.assert_allclose(state["omega"], (0.0, 0.0, 0.0))
+        np.testing.assert_allclose(state["rotation"], np.eye(3))
+
+    def test_fixed_joint_locks_all_body_dofs(self):
+        body = SimpleNamespace(path="/Fixed", joint_type="fixed")
+        state = {
+            "translation": np.asarray((1.0, 2.0, 3.0)),
+            "velocity": np.asarray((4.0, 5.0, 6.0)),
+            "rotation": np.diag((-1.0, 1.0, -1.0)),
+            "omega": np.asarray((0.1, 0.2, 0.3)),
+        }
+        constrain_body_state(body, state)
+        np.testing.assert_allclose(state["translation"], (0.0, 0.0, 0.0))
+        np.testing.assert_allclose(state["velocity"], (0.0, 0.0, 0.0))
+        np.testing.assert_allclose(state["omega"], (0.0, 0.0, 0.0))
+        np.testing.assert_allclose(state["rotation"], np.eye(3))
+
     def test_standard_usd_physics_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
             source_file = Path(directory) / "standard_physics.usda"
@@ -139,11 +198,16 @@ class GranularTests(unittest.TestCase):
             ).Set(1600.0)
             stage.GetRootLayer().Save()
 
+            preview_file = Path(directory) / "mixed_preview.npz"
+            checkpoint_file = Path(directory) / "mixed_checkpoint.usdc"
             result = run_simulation(
                 source_file, sph_cfg=SPHConfig(dp=0.05),
                 settings=SolverSettings(
-                    sim_time=0.01, output_fps=100.0, output_dir=directory,
+                    sim_time=0.02, output_fps=100.0, output_dir=directory,
                     output_stem="mixed_result", report_interval=100.0,
+                    preview_file=str(preview_file), preview_interval=0.05,
+                    usd_checkpoint_file=str(checkpoint_file),
+                    usd_checkpoint_interval=0.25,
                 ),
             )
             output = Usd.Stage.Open(result.usd_file)
@@ -157,6 +221,22 @@ class GranularTests(unittest.TestCase):
             self.assertGreater(
                 len(UsdGeom.Points(granular).GetPointsAttr().GetTimeSamples()), 1
             )
+            self.assertTrue(preview_file.is_file())
+            checkpoint = Usd.Stage.Open(str(checkpoint_file))
+            checkpoint_fluid = UsdGeom.Points.Get(checkpoint, "/GraSPH_Result")
+            checkpoint_granular = UsdGeom.Points.Get(
+                checkpoint, "/GraSPH_GranularResult"
+            )
+            self.assertTrue(checkpoint_fluid)
+            self.assertTrue(checkpoint_granular)
+            self.assertLess(
+                checkpoint.GetEndTimeCode(), output.GetEndTimeCode()
+            )
+            self.assertFalse(preview_file.with_name(preview_file.name + ".tmp").exists())
+            with np.load(preview_file) as preview:
+                self.assertAlmostEqual(float(preview["progress"]), 1.0)
+                self.assertGreater(len(preview["positions"]), 0)
+                self.assertGreater(len(preview["granular_positions"]), 0)
 
     def test_fluid_dynamic_body_coupling_is_optional(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -199,25 +279,12 @@ class GranularTests(unittest.TestCase):
             self.assertGreaterEqual(len(samples), 2)
             self.assertLess(float(translate.Get(samples[-1])[2]), 0.0)
 
-    def test_dynamic_body_falls_and_authors_transform(self):
+    def test_dynamic_body_only_scene_runs_and_authors_transform(self):
         with tempfile.TemporaryDirectory() as directory:
             source_file = Path(directory) / "dynamic_body.usda"
             stage = Usd.Stage.CreateNew(str(source_file))
             UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
             UsdGeom.SetStageMetersPerUnit(stage, 1.0)
-
-            # A dormant flow source selects granular mode without adding grains.
-            source = _cube(
-                stage, "/Flow", (-0.05, -0.05, 1.0),
-                (0.05, 0.05, 1.1), "granular_source",
-            )
-            for name, value_type, value in (
-                ("grasph:sourceMode", Sdf.ValueTypeNames.String, "flow"),
-                ("grasph:particleRadius", Sdf.ValueTypeNames.Double, 0.02),
-                ("grasph:startTime", Sdf.ValueTypeNames.Double, 1.0),
-                ("grasph:endTime", Sdf.ValueTypeNames.Double, 2.0),
-            ):
-                source.CreateAttribute(name, value_type).Set(value)
 
             body_driver = UsdGeom.Xform.Define(stage, "/Body")
             body_driver.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.0))
@@ -251,6 +318,8 @@ class GranularTests(unittest.TestCase):
             final = translate.Get(translate.GetTimeSamples()[-1])
             self.assertLess(float(final[2]), 0.0)
             self.assertGreater(float(final[2]), -0.30)
+            with np.load(result.npz_file) as data:
+                self.assertEqual(data["positions"].shape[1], 0)
 
     def test_volume_source_falls_and_writes_granular_usd(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -277,6 +346,7 @@ class GranularTests(unittest.TestCase):
             self.assertEqual(len(initial), 8)
             self.assertTrue(np.all(source_ids == 0))
 
+            checkpoint_file = Path(directory) / "granular_checkpoint.usdc"
             result = run_simulation(
                 source_file,
                 sph_cfg=SPHConfig(dp=0.05),
@@ -284,6 +354,8 @@ class GranularTests(unittest.TestCase):
                     sim_time=0.25, output_fps=20.0, output_dir=directory,
                     output_stem="granular_result", granular_dt=0.002,
                     granular_iterations=4, report_interval=100.0,
+                    usd_checkpoint_file=str(checkpoint_file),
+                    usd_checkpoint_interval=0.25,
                 ),
             )
             self.assertEqual(len(result.positions), 8)
@@ -293,6 +365,10 @@ class GranularTests(unittest.TestCase):
             prim = output.GetPrimAtPath("/GraSPH_GranularResult")
             self.assertTrue(prim.IsValid())
             self.assertEqual(prim.GetAttribute("grasph:resultKind").Get(), "granular")
+            checkpoint = Usd.Stage.Open(str(checkpoint_file))
+            checkpoint_prim = checkpoint.GetPrimAtPath("/GraSPH_GranularResult")
+            self.assertTrue(checkpoint_prim.IsValid())
+            self.assertLess(checkpoint.GetEndTimeCode(), output.GetEndTimeCode())
 
     def test_flow_source_adds_particles_over_time(self):
         with tempfile.TemporaryDirectory() as directory:

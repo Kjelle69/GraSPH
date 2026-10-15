@@ -9,7 +9,7 @@ from grasph_sph import (
     neighbor_counts, compute_density_rate, compute_pressure,
     compute_pressure_acceleration, compute_artificial_viscosity_acceleration,
     compute_cfl_dt, configure_neighbor_search, active_neighbor_backend, neighbor_worker_count,
-    detached_component_mask,
+    detached_component_mask, CachedFluidNeighborSearch,
 )
 from grasph_collision import build_colliders, resolve_collisions
 from grasph_boundary import (
@@ -19,7 +19,7 @@ from grasph_boundary import (
 )
 from grasph_reference import hydrostatic_reference_state, compute_well_balanced_base_acceleration
 from grasph_free_surface import FreeSurfaceConfig, collider_triangle_data, compute_atmospheric_state
-from grasph_output import save_npz, write_usd_animation
+from grasph_output import save_npz, write_usd_animation, write_usd_checkpoint
 from grasph_coupling import couple_fluid_grains
 from grasph_granular import (
     _append_particles as append_grains,
@@ -28,7 +28,9 @@ from grasph_granular import (
 )
 from grasph_rigid import (
     advance_rotation, resolve_body_contacts, rotation_to_euler_xyz, world_inertia,
+    constrain_body_state,
 )
+from grasph_runtime import wait_if_paused
 
 
 @dataclass
@@ -40,6 +42,8 @@ class SolverSettings:
     report_interval: float = 1.0
     particle_radius_factor: float = 0.45
     viscosity_alpha: float = 0.05
+    detached_air_density: float = 1.225
+    detached_air_drag_cd: float = 0.47
     collision_iterations: int = 2
     enable_wall_pressure: bool = True
     enable_wall_continuity: bool = True
@@ -55,6 +59,13 @@ class SolverSettings:
     granular_dt: float = 0.001
     granular_iterations: int = 4
     enable_solid_coupling: bool = False
+    preview_file: str = ""
+    preview_interval: float = 0.05
+    control_file: str = ""
+    usd_checkpoint_file: str = ""
+    usd_checkpoint_interval: float = 0.10
+    restart_npz: str = ""
+    restart_time: float = 0.0
 
 
 @dataclass
@@ -91,6 +102,20 @@ def _fmt_time(seconds):
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
+def _speed_stats(velocity, mask=None):
+    """Return median, 95th percentile, and RMS speed for selected particles."""
+    speed = np.linalg.norm(np.asarray(velocity, dtype=np.float64), axis=1)
+    if mask is not None:
+        speed = speed[np.asarray(mask, dtype=bool)]
+    if not len(speed):
+        return 0.0, 0.0, 0.0
+    return (
+        float(np.median(speed)),
+        float(np.percentile(speed, 95)),
+        float(np.sqrt(np.mean(speed * speed))),
+    )
+
+
 def _empty_wall_interactions():
     return {
         "pair_i": np.empty(0, dtype=np.int32),
@@ -100,6 +125,26 @@ def _empty_wall_interactions():
         "W": np.empty(0, dtype=np.float64),
         "gradW": np.empty((0, 3), dtype=np.float64),
     }
+
+
+def apply_detached_air_drag(velocity, detached, dt, particle_radius,
+                            fluid_density=1000.0, air_density=1.225,
+                            drag_coefficient=0.47):
+    """Apply implicit quadratic aerodynamic drag to detached fluid parcels.
+
+    Parcels are treated as equivalent spheres. The exact-in-speed update for
+    dv/dt = -k |v| v avoids an explicit-drag stability restriction.
+    """
+    if drag_coefficient <= 0.0 or air_density <= 0.0 or dt <= 0.0:
+        return
+    ids = np.flatnonzero(detached)
+    if not len(ids):
+        return
+    speed = np.linalg.norm(velocity[ids], axis=1)
+    k = 3.0 * air_density * drag_coefficient / (
+        8.0 * fluid_density * max(float(particle_radius), 1.0e-12)
+    )
+    velocity[ids] /= (1.0 + k * speed * dt)[:, None]
 
 
 def _sink_keep_mask(pos, sinks):
@@ -115,6 +160,87 @@ def _pad_frames(frames, capacity, trailing_shape=(), dtype=np.float32, fill=np.n
     for i, frame in enumerate(frames):
         out[i, :len(frame)] = frame
     return out
+
+
+def _load_fluid_restart(path, frame_time, initial_positions, sph_cfg, fs_cfg):
+    """Load a fluid-only state from a saved GraSPH NPZ frame."""
+    with np.load(path, allow_pickle=False) as data:
+        required = {
+            "positions", "velocity", "rho", "active_particle_ids",
+            "active_counts", "times", "dp", "rho0", "c0",
+        }
+        missing = required.difference(data.files)
+        if missing:
+            raise RuntimeError(f"Restart file is missing fields: {', '.join(sorted(missing))}")
+        for key, expected in (("dp", sph_cfg.dp), ("rho0", sph_cfg.rho0), ("c0", sph_cfg.c0)):
+            actual = float(np.asarray(data[key]).item())
+            if not np.isclose(actual, expected, rtol=1e-6, atol=1e-9):
+                raise RuntimeError(
+                    f"Restart {key}={actual:g} does not match current scene setting {expected:g}."
+                )
+        if "h" in data.files and not np.isclose(
+            float(np.asarray(data["h"]).item()), sph_cfg.h, rtol=1e-6, atol=1e-9
+        ):
+            raise RuntimeError("Restart smoothing length does not match current solver settings.")
+        if "gravity" in data.files and not np.allclose(
+            np.asarray(data["gravity"], dtype=np.float64), sph_cfg.gravity,
+            rtol=1e-6, atol=1e-8,
+        ):
+            raise RuntimeError("Restart gravity does not match the current solver settings.")
+        if "free_surface_mode" in data.files:
+            old_mode = str(np.asarray(data["free_surface_mode"]).item())
+            if old_mode != fs_cfg.mode:
+                raise RuntimeError(
+                    f"Restart free-surface mode '{old_mode}' does not match '{fs_cfg.mode}'."
+                )
+        for key in ("body_paths", "hinge_paths"):
+            if key in data.files and len(data[key]):
+                raise RuntimeError(
+                    "This first restart version supports fluid-only results. "
+                    f"The selected result contains simulated {key.replace('_', ' ')}."
+                )
+        if "granular_active_counts" in data.files and np.any(data["granular_active_counts"] > 0):
+            raise RuntimeError("This first restart version supports fluid-only results, not granular state.")
+
+        times = np.asarray(data["times"], dtype=np.float64)
+        if not len(times):
+            raise RuntimeError("Restart file contains no saved frames.")
+        index = int(np.argmin(np.abs(times - float(frame_time))))
+        selected_time = float(times[index])
+        frame_spacing = float(np.median(np.diff(times))) if len(times) > 1 else 0.0
+        time_tolerance = max(1e-5, 0.51 * frame_spacing)
+        if abs(selected_time - float(frame_time)) > time_tolerance:
+            raise RuntimeError(
+                f"No saved frame near {float(frame_time):.6g}s; nearest is {selected_time:.6g}s."
+            )
+        capacity = int(np.asarray(data["positions"]).shape[1])
+        count = int(np.asarray(data["active_counts"])[index])
+        if count <= 0 or count > capacity:
+            raise RuntimeError("Selected restart frame has no valid active fluid particles.")
+        ids = np.asarray(data["active_particle_ids"][index, :count], dtype=np.int32)
+        pos = np.asarray(data["positions"][index, :count], dtype=np.float64)
+        vel = np.asarray(data["velocity"][index, :count], dtype=np.float64)
+        rho = np.asarray(data["rho"][index, :count], dtype=np.float64)
+        valid = (ids >= 0) & np.all(np.isfinite(pos), axis=1) & np.all(np.isfinite(vel), axis=1) & np.isfinite(rho)
+        ids, pos, vel, rho = ids[valid], pos[valid], vel[valid], rho[valid]
+        if not len(pos):
+            raise RuntimeError("Selected restart frame contains no finite fluid state.")
+
+        baseline_key = "source_initial_positions"
+        if baseline_key in data.files:
+            saved_initial = np.asarray(data[baseline_key], dtype=np.float64)
+        else:
+            first_count = int(np.asarray(data["active_counts"])[0])
+            saved_initial = np.asarray(data["positions"][0, :first_count], dtype=np.float64)
+        if saved_initial.shape != initial_positions.shape or not np.allclose(
+            saved_initial, initial_positions, rtol=1e-5, atol=1e-5
+        ):
+            raise RuntimeError(
+                "Current fluid source does not match the selected result's original particle layout. "
+                "Keep the source volume and particle spacing unchanged when continuing."
+            )
+        surface_level = float(np.asarray(data["surface_level"]).item()) if "surface_level" in data.files else None
+    return pos, vel, rho, ids, capacity, surface_level, selected_time
 
 
 
@@ -216,7 +342,12 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
     configure_neighbor_search(settings.neighbor_backend, settings.neighbor_workers)
 
     scene = load_scene(usd_file)
-    if scene.granular_sources and not scene.fluid_sources:
+    if settings.restart_npz and scene.granular_sources:
+        raise RuntimeError(
+            "This first restart version is fluid-only. Remove granular sources from "
+            "the continuation scene; granular state is not restored yet."
+        )
+    if not scene.fluid_sources and (scene.granular_sources or scene.dynamic_bodies or scene.hinges):
         from grasph_granular import run_granular_simulation
         return run_granular_simulation(
             usd_file, scene, settings, gravity=sph_cfg.gravity
@@ -242,32 +373,62 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
     worker_text = "all" if neighbor_worker_count() == -1 else str(neighbor_worker_count())
     print(f"neighbors    : {active_neighbor_backend()} (large-query workers={worker_text})")
     print(f"wall cross search: {settings.wall_search}, adaptive sparse<=2500 / parallel-radius>2500")
+    print(f"fluid pair cache: {'ON' if settings.wall_search == 'cached' else 'OFF'} (exact support filtering)")
+    print(
+        f"detached air drag: rho_air={settings.detached_air_density:.3g} kg/m3, "
+        f"Cd={settings.detached_air_drag_cd:.3g} "
+        "(equivalent-sphere approximation; Cd=0 disables)"
+    )
     if settings.droplet_mode == "components":
         print("droplet fallback: disconnected fluid components -> ordinary WCSPH + full gravity")
     else:
         print(f"droplet fallback: fluid neighbors <= {settings.detached_neighbor_max}")
 
-    pos = generate_fluid_particles(scene, dp=sph_cfg.dp)
-    if len(pos) == 0:
-        raise RuntimeError("No fluid particles generated. Use a FluidVolume mesh or grasph:role='fluid'.")
-    if scene.granular_sources and len(pos) < 8:
+    initial_positions = generate_fluid_particles(scene, dp=sph_cfg.dp, particle_radius=particle_radius)
+    if len(initial_positions) == 0:
         raise RuntimeError(
-            f"Mixed fluid/granular simulation generated only {len(pos)} fluid "
+            "No fluid particles generated. Use a Fluid Volume, Granular Source, "
+            "or moving rigid body."
+        )
+    if scene.granular_sources and len(initial_positions) < 8:
+        raise RuntimeError(
+            f"Mixed fluid/granular simulation generated only {len(initial_positions)} fluid "
             f"particle(s) at dp={sph_cfg.dp:g} m. Use a larger Fluid Volume or "
             "reduce Particle Spacing; at least 8 are required and 64+ are recommended."
         )
+    restart_time = 0.0
+    if settings.restart_npz:
+        (pos, vel, rho, particle_ids, capacity, saved_surface_level,
+         restart_time) = _load_fluid_restart(
+            settings.restart_npz, settings.restart_time, initial_positions,
+            sph_cfg, fs_cfg,
+        )
+        if saved_surface_level is None:
+            raise RuntimeError("Restart file is missing its fluid surface level.")
+        surface_level = saved_surface_level
+        removed_count = capacity - len(pos)
+        print(
+            f"Restarting fluid from {settings.restart_npz} at "
+            f"t={restart_time:.6f}s ({len(pos)} active particles)."
+        )
+    else:
+        pos = initial_positions.copy()
+        vel = np.zeros_like(pos, dtype=np.float64)
+        particle_ids = np.arange(len(pos), dtype=np.int32)
+        capacity = len(pos)
+        removed_count = 0
     n = len(pos)
-    capacity = n
-    particle_ids = np.arange(n, dtype=np.int32)
-    removed_count = 0
-    vel = np.zeros_like(pos, dtype=np.float64)
 
     gvec = np.asarray(sph_cfg.gravity, dtype=np.float64)
     gmag = float(np.linalg.norm(gvec))
     up = (-gvec / gmag) if gmag > 1e-15 else np.array([0.0, 0.0, 1.0])
-    surface_level = float(np.max(pos @ up) + 0.5 * sph_cfg.dp)
-    rho_ref, p_ref, _ = hydrostatic_reference_state(pos, surface_level, sph_cfg, return_depth=True)
-    rho = rho_ref.copy()
+    if not settings.restart_npz:
+        surface_level = float(np.max(pos @ up) + 0.5 * sph_cfg.dp)
+    rho_ref, p_ref, _ = hydrostatic_reference_state(
+        pos, surface_level, sph_cfg, return_depth=True
+    )
+    if not settings.restart_npz:
+        rho = rho_ref.copy()
 
     # Mixed mode: spherical DEM grains share the WCSPH timestep. This keeps
     # the fast neighbour pipeline and avoids a second global solver loop.
@@ -318,6 +479,7 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
     base_boundary_positions = boundary.positions.copy()
     base_boundary_normals = boundary.normals.copy()
     wall_search = CachedWallNeighborSearch(boundary) if settings.wall_search == "cached" else None
+    fluid_search = CachedFluidNeighborSearch(0.25 * sph_cfg.dp) if settings.wall_search == "cached" else None
     base_facing_positions = None if boundary.facing_positions is None else boundary.facing_positions.copy()
     wall_velocity = np.zeros_like(boundary.positions, dtype=np.float64)
     solid_triangles_base, solid_normals_base, solid_triangle_paths = collider_triangle_data(scene)
@@ -343,7 +505,7 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
     # Reference pose is the USD stage start time. Any animated collider is
     # sampled in source-scene seconds from there. v0.54 supports pure
     # translation (perfect for a vertically lifted gate).
-    motion0 = scene.collider_motion(0.0) if scene.colliders else {}
+    motion0 = scene.collider_motion(restart_time) if scene.colliders else {}
     _apply_boundary_motion(
         boundary, base_boundary_positions, base_boundary_normals,
         base_facing_positions, motion0,
@@ -362,6 +524,97 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
     frame_body_rotations = {path: [] for path in body_paths}
     frame_grain_positions, frame_grain_velocities = [], []
     frame_grain_radii, frame_grain_ids = [], []
+    preview_interval = max(0.01, float(settings.preview_interval))
+    next_preview = restart_time + preview_interval
+
+    def write_preview(t):
+        """Atomically publish the latest solver state for Blender's live viewport."""
+        nonlocal next_preview
+        if not settings.preview_file:
+            return
+        from pathlib import Path
+        import os
+        preview_path = Path(settings.preview_file)
+        preview_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = preview_path.with_name(preview_path.name + ".tmp")
+        with temporary.open("wb") as stream:
+            np.savez(
+                stream, time=np.asarray(float(t)), progress=np.asarray(min(
+                    1.0, max(0.0, (float(t) - restart_time) / max(settings.sim_time, 1e-12))
+                )), positions=np.asarray(pos, dtype=np.float32),
+                velocity=np.asarray(vel, dtype=np.float32),
+                granular_positions=np.asarray(grain_pos, dtype=np.float32),
+                granular_velocity=np.asarray(grain_vel, dtype=np.float32),
+                granular_radii=np.asarray(grain_radii, dtype=np.float32),
+                body_paths=np.asarray(body_paths, dtype="U512"),
+                body_translations=np.asarray([
+                    body_states[path]["translation"] for path in body_paths
+                ], dtype=np.float64),
+                body_rotations=np.asarray([
+                    rotation_to_euler_xyz(body_states[path]["rotation"])
+                    for path in body_paths
+                ], dtype=np.float64).reshape((-1, 3)),
+                hinge_paths=np.asarray(hinge_paths, dtype="U512"),
+                hinge_angles=np.asarray([
+                    hinge_states[path]["angle"] for path in hinge_paths
+                ], dtype=np.float64),
+            )
+        os.replace(temporary, preview_path)
+        elapsed = float(t) - restart_time
+        next_preview = restart_time + (
+            np.floor(elapsed / preview_interval + 1e-10) + 1.0
+        ) * preview_interval
+
+    checkpoint_interval = max(0.01, min(
+        1.0, float(getattr(settings, "usd_checkpoint_interval", 0.10))
+    ))
+    next_checkpoint = checkpoint_interval
+
+    def write_animation(output_file, checkpoint=False):
+        writer = write_usd_checkpoint if checkpoint else write_usd_animation
+        writer(
+            scene.stage, frame_positions, frame_times, settings.output_fps,
+            sph_cfg.dp, output_file,
+            source_start_time_code=scene.start_time_code,
+            source_tps=scene.time_codes_per_second,
+            frame_velocities=frame_velocity,
+            hinge_frames={
+                path: {
+                    "driver_path": scene.hinges[path].driver_path,
+                    "axis": scene.hinges[path].axis,
+                    "angles": np.asarray(frame_hinge_angles)[:, i],
+                }
+                for i, path in enumerate(hinge_paths)
+            },
+            body_frames={
+                path: {
+                    "driver_path": scene.dynamic_bodies[path].driver_path,
+                    "translations": np.asarray(frame_body_translations[path]),
+                    "rotations": np.asarray(frame_body_rotations[path]),
+                }
+                for path in body_paths
+            },
+            extra_particle_sets=([{
+                "prim_path": "/GraSPH_GranularResult",
+                "result_kind": "granular",
+                "frames": frame_grain_positions,
+                "velocities": frame_grain_velocities,
+                "widths": [2.0 * values for values in frame_grain_radii],
+            }] if grain_sources else None),
+        )
+
+    def write_partial_checkpoint(t):
+        nonlocal next_checkpoint
+        checkpoint_file = getattr(settings, "usd_checkpoint_file", "")
+        if not checkpoint_file or t >= restart_time + settings.sim_time - 1e-12:
+            return
+        progress = (float(t) - restart_time) / max(float(settings.sim_time), 1e-12)
+        if progress + 1e-10 < next_checkpoint:
+            return
+        write_animation(checkpoint_file, checkpoint=True)
+        next_checkpoint = (
+            np.floor(progress / checkpoint_interval + 1e-10) + 1.0
+        ) * checkpoint_interval
 
     def snapshot(t, state=None, detached=None):
         rr, pp, _ = hydrostatic_reference_state(pos, surface_level, sph_cfg, return_depth=True)
@@ -405,6 +658,9 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
         frame_grain_velocities.append(grain_vel.copy())
         frame_grain_radii.append(grain_radii.copy())
         frame_grain_ids.append(grain_ids.copy())
+        if float(t) + 1e-12 >= next_preview or abs(float(t) - restart_time) < 1e-12:
+            write_preview(t)
+        write_partial_checkpoint(float(t))
 
     pair_i0, pair_j0 = build_neighbor_pairs(pos, sph_cfg.support)
     counts0 = neighbor_counts(n, pair_i0, pair_j0)
@@ -418,13 +674,14 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
     fs_state = compute_atmospheric_state(
         pos, rho, rho_ref, pair_i0, pair_j0, gradW0,
         boundary, wall_int0, solid_triangles, solid_normals,
-        surface_level, sph_cfg, fs_cfg,
+        surface_level, sph_cfg, fs_cfg, active_mask=~detached0,
     )
-    snapshot(0.0, fs_state, detached0)
+    t = restart_time
+    snapshot(t, fs_state, detached0)
 
     output_interval = 1.0 / settings.output_fps
-    next_output = output_interval
-    t = 0.0
+    next_output = restart_time + output_interval
+    end_time = restart_time + settings.sim_time
     step = 0
     total_contacts = 0
     max_collider_travel_seen = 0.0
@@ -449,10 +706,11 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
         print(f"Fluid/granular coupling: ON ({len(grain_pos)} initial grains)")
     print("========================================\n")
 
-    while t < settings.sim_time - 1e-15:
+    while t < end_time - 1e-15:
+        wait_if_paused(settings.control_file)
         dt = min(settings.dt_max, compute_cfl_dt(vel, sph_cfg.h, sph_cfg.c0, cfl=settings.cfl))
-        if t + dt > settings.sim_time:
-            dt = settings.sim_time - t
+        if t + dt > end_time:
+            dt = end_time - t
         for event_time in hooks.event_times:
             event_time = float(event_time)
             if t < event_time < t + dt:
@@ -461,6 +719,9 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
 
         for path, state in body_states.items():
             body = scene.dynamic_bodies[path]
+            if getattr(body, "joint_type", "free") == "fixed":
+                constrain_body_state(body, state)
+                continue
             state["velocity"] += np.asarray(sph_cfg.gravity) * dt
             state["velocity"] /= 1.0 + body.linear_damping * dt
             state["omega"] /= 1.0 + body.angular_damping * dt
@@ -554,7 +815,8 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
         )
 
         _tp = time.perf_counter()
-        pair_i, pair_j = build_neighbor_pairs(pos, sph_cfg.support)
+        pair_i, pair_j = (fluid_search.query(pos, sph_cfg.support) if fluid_search
+                          else build_neighbor_pairs(pos, sph_cfg.support))
         rij, r, gradW = compute_pair_geometry(pos, pair_i, pair_j, kernel)
         counts = neighbor_counts(n, pair_i, pair_j)
         perf["fluid_neighbors"] += time.perf_counter() - _tp
@@ -587,18 +849,18 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
 
         need_wall = settings.enable_wall_pressure or settings.enable_wall_continuity or fs_cfg.mode != "none"
         _tp = time.perf_counter()
-        active_wall_search = None if (hinge_states or body_states) else wall_search
+        active_wall_search = wall_search
         wall_interactions = build_wall_interactions(
             pos, boundary, kernel, sph_cfg.support, active_wall_search, motion_now
         ) if (need_wall and len(boundary.positions)) else _empty_wall_interactions()
         perf["wall_interactions"] += time.perf_counter() - _tp
-        wall_rho_ref, _, _ = hydrostatic_reference_state(boundary.positions, surface_level, sph_cfg, return_depth=True)
+        wall_rho_ref, wall_p_ref, _ = hydrostatic_reference_state(boundary.positions, surface_level, sph_cfg, return_depth=True)
 
         _tp = time.perf_counter()
         fs_state = compute_atmospheric_state(
             pos, rho, rho_ref, pair_i, pair_j, gradW,
             boundary, wall_interactions, solid_triangles, solid_normals,
-            surface_level, sph_cfg, fs_cfg,
+            surface_level, sph_cfg, fs_cfg, active_mask=~detached,
         )
         perf["free_surface"] += time.perf_counter() - _tp
 
@@ -615,8 +877,30 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
         pressure_torques = {path: 0.0 for path in hinge_states}
         pressure_body_forces = {path: np.zeros(3) for path in body_states}
         pressure_body_torques = {path: np.zeros(3) for path in body_states}
+        hydrostatic_body_forces = {path: np.zeros(3) for path in body_states}
         if len(wall_pair_j) and (hinge_states or body_states):
             reaction_forces = -sph_cfg.mass * wall_pair_acceleration
+            # Fluid uses a well-balanced equation with hydrostatic pressure
+            # removed analytically. A solid still feels that reference load.
+            # Restore it on moving-solid pairs only, using the SAME discrete
+            # wall operator as the perturbation pressure (no buoyancy scale).
+            moving_sources = [i for i, path in enumerate(boundary.source_paths)
+                              if path in hinge_states or path in body_states]
+            moving_pairs = np.isin(boundary.source_ids[wall_pair_j], moving_sources)
+            reference_interactions = {
+                key: wall_interactions[key][moving_pairs]
+                for key in ("pair_i", "pair_j", "gradW")
+            }
+            _, reference_acceleration = add_static_wall_pressure_acceleration(
+                np.zeros_like(pos), rho, p_ref, boundary,
+                reference_interactions, wall_rho_ref, wall_p_ref,
+            )
+            reaction_forces[moving_pairs] -= sph_cfg.mass * reference_acceleration
+            reference_source_ids = boundary.source_ids[reference_interactions["pair_j"]]
+            for source_id, path in enumerate(boundary.source_paths):
+                if path in body_states:
+                    hydrostatic_body_forces[path] = -sph_cfg.mass * np.sum(
+                        reference_acceleration[reference_source_ids == source_id], axis=0)
             for source_id, path in enumerate(boundary.source_paths):
                 if path not in hinge_states and path not in body_states:
                     continue
@@ -660,6 +944,13 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
         # Symplectic kick -> continuity -> drift. This is the frozen v0.16+
         # bulk update; v0.53 changes architecture, not timestep physics.
         vel += acc * dt
+        apply_detached_air_drag(
+            vel, detached, dt,
+            particle_radius=(3.0 * sph_cfg.mass / (4.0 * np.pi * sph_cfg.rho0)) ** (1.0 / 3.0),
+            fluid_density=sph_cfg.rho0,
+            air_density=settings.detached_air_density,
+            drag_coefficient=settings.detached_air_drag_cd,
+        )
         drho = compute_density_rate(vel, pair_i, pair_j, gradW, sph_cfg.mass)
         if settings.enable_wall_continuity and len(boundary.positions):
             add_static_wall_density_rate(
@@ -767,6 +1058,7 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
                 pressure_body_torques[path] * dt
                 + angular_impulses.get(path, np.zeros(3)),
             )
+            constrain_body_state(body, state)
 
         body_contacts, body_hinge_reactions = resolve_body_contacts(
             scene, colliders, body_states, motion_next, collider_velocities,
@@ -779,7 +1071,8 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
                 continue
             hinge = scene.hinges[path]
             hinge_states[path]["omega"] += float(np.dot(impulse, hinge.axis)) / hinge.moment_of_inertia
-        for state in body_states.values():
+        for path, state in body_states.items():
+            constrain_body_state(scene.dynamic_bodies[path], state)
             state["translation"] += state["velocity"] * dt
             state["rotation"] = advance_rotation(state["rotation"], state["omega"], dt)
 
@@ -823,16 +1116,19 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
             break
 
         now = time.perf_counter()
-        if now - last_report >= settings.report_interval or t >= settings.sim_time - 1e-15:
+        if now - last_report >= settings.report_interval or t >= end_time - 1e-15:
             elapsed = now - start
-            progress = t / settings.sim_time if settings.sim_time > 0 else 1.0
+            progress = (t - restart_time) / settings.sim_time if settings.sim_time > 0 else 1.0
             eta = elapsed * (1.0 - progress) / progress if progress > 0 else 0.0
             rr, pp, _ = hydrostatic_reference_state(pos, surface_level, sph_cfg, return_depth=True)
             qq = compute_pressure(rho, sph_cfg.rho0, sph_cfg.tait_B, sph_cfg.gamma) - pp
             speed = np.linalg.norm(vel, axis=1)
+            main_v50, main_v95, main_vrms = _speed_stats(vel, ~detached)
+            spray_v50, spray_v95, spray_vrms = _speed_stats(vel, detached)
             print(
                 f"[{_fmt_time(elapsed)}] step {step:5d} | {progress*100:5.1f}% "
-                f"| sim {t:.4f}/{settings.sim_time:.4f}s | dt={dt:.7f} "
+                f"| sim {t-restart_time:.4f}/{settings.sim_time:.4f}s "
+                f"(scene t={t:.4f}s) | dt={dt:.7f} "
                 f"| {step/elapsed:5.1f} step/s | ETA {_fmt_time(eta)}"
             )
             kin_shift = max((float(np.linalg.norm(v)) for v in motion_now.values()), default=0.0)
@@ -845,6 +1141,8 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
                 f"| qabs={np.mean(np.abs(qq)):.1f}/{np.max(np.abs(qq)):.1f}Pa "
                 f"| vmax={speed.max():.3f} | shell={np.count_nonzero(fs_state['shell'])} "
                 f"| band={np.count_nonzero(fs_state['band'])} | detached={np.count_nonzero(detached)} "
+                f"| vmain50/95/rms={main_v50:.3f}/{main_v95:.3f}/{main_vrms:.3f} "
+                f"| vspray50/95/rms={spray_v50:.3f}/{spray_v95:.3f}/{spray_vrms:.3f} "
                 f"| comps={current_ncomp} main={current_main_size} | contacts={contacts}" + kin_text
             )
             if grain_sources:
@@ -861,6 +1159,15 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
                 print(
                     f"    axle {Path(path).name}: angle={np.degrees(state['angle']):+.2f}deg "
                     f"omega={state['omega']:+.3f}rad/s torque={state['torque']:+.5f}Nm"
+                )
+            for path, state in body_states.items():
+                body = scene.dynamic_bodies[path]
+                center = body.center + state["translation"]
+                print(
+                    f"    body {Path(path).name}: mass={body.mass:g}kg "
+                    f"z={center[2]:.5f}m vz={state['velocity'][2]:+.4f}m/s "
+                    f"FpressureZ={pressure_body_forces[path][2]:+.4f}N "
+                    f"FhydroZ={hydrostatic_body_forces[path][2]:+.4f}N"
                 )
             last_report = now
 
@@ -883,9 +1190,11 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
         removed_count=np.asarray(removed_count, dtype=np.int32),
         times=np.asarray(frame_times, dtype=np.float64),
         source_file=np.asarray(str(usd_file)),
+        source_initial_positions=np.asarray(initial_positions, dtype=np.float64),
         surface_level=np.asarray(surface_level),
         dp=np.asarray(sph_cfg.dp), h=np.asarray(sph_cfg.h), support=np.asarray(sph_cfg.support),
         mass=np.asarray(sph_cfg.mass), rho0=np.asarray(sph_cfg.rho0), c0=np.asarray(sph_cfg.c0),
+        gravity=np.asarray(sph_cfg.gravity, dtype=np.float64),
         free_surface_mode=np.asarray(fs_cfg.mode),
         usd_start_time_code=np.asarray(scene.start_time_code),
         usd_time_codes_per_second=np.asarray(scene.time_codes_per_second),
@@ -913,35 +1222,9 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
         ], dtype=np.int32),
     )
     print("\nWriting outputs...")
+    write_preview(t)
     save_npz(npz_output, **arrays)
-    write_usd_animation(
-        scene.stage, frame_positions, frame_times, settings.output_fps, sph_cfg.dp, usd_output,
-        source_start_time_code=scene.start_time_code, source_tps=scene.time_codes_per_second,
-        frame_velocities=frame_velocity,
-        hinge_frames={
-            path: {
-                "driver_path": scene.hinges[path].driver_path,
-                "axis": scene.hinges[path].axis,
-                "angles": np.asarray(frame_hinge_angles)[:, i],
-            }
-            for i, path in enumerate(hinge_paths)
-        },
-        body_frames={
-            path: {
-                "driver_path": scene.dynamic_bodies[path].driver_path,
-                "translations": np.asarray(frame_body_translations[path]),
-                "rotations": np.asarray(frame_body_rotations[path]),
-            }
-            for path in body_paths
-        },
-        extra_particle_sets=([{
-            "prim_path": "/GraSPH_GranularResult",
-            "result_kind": "granular",
-            "frames": frame_grain_positions,
-            "velocities": frame_grain_velocities,
-            "widths": [2.0 * values for values in frame_grain_radii],
-        }] if grain_sources else None),
-    )
+    write_animation(usd_output)
 
     elapsed = time.perf_counter() - start
     rr, pp, _ = hydrostatic_reference_state(pos, surface_level, sph_cfg, return_depth=True)

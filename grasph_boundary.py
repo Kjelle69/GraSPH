@@ -5,6 +5,8 @@ import time
 from dataclasses import dataclass
 
 import numpy as np
+
+_WALL_PAIR_CHUNK = 16384
 from pxr import UsdGeom, Gf
 
 from grasph_scene import load_scene, generate_fluid_particles
@@ -1051,16 +1053,65 @@ def assign_half_cell_wall_volumes(
 # ============================================================
 
 class CachedWallNeighborSearch:
-    """Boundary adapter; every collider keeps its own reference-pose tree."""
+    """Skin-buffered wall neighbor list with exact per-step radius filtering.
 
-    def __init__(self, boundary):
-        self.source_paths = tuple(boundary.source_paths)
-        self.search = TranslationNeighborSearch(boundary.positions, boundary.source_ids)
+    Candidates are rebuilt when the sum of maximum fluid and wall displacement
+    reaches the skin width. Translation and rotation are both supported; actual
+    distances, normals and forces are evaluated at the current pose every step.
+    """
+
+    def __init__(self, boundary, skin=0.025):
+        self.skin = max(0.0, float(skin))
+        self.reference_fluid = None
+        self.candidate_i = np.empty(0, dtype=np.int32)
+        self.candidate_j = np.empty(0, dtype=np.int32)
+        self.reference_boundary = None
+        self.reference_support = None
 
     def query(self, fluid_pos, boundary, support, translations):
-        shifts = {i: translations.get(path, (0.0, 0.0, 0.0))
-                  for i, path in enumerate(self.source_paths)}
-        return self.search.query(fluid_pos, boundary.positions, support, shifts)
+        fluid_pos = np.asarray(fluid_pos, dtype=np.float64)
+        rebuild = (
+            self.reference_fluid is None
+            or self.reference_fluid.shape != fluid_pos.shape
+            or self.reference_boundary.shape != boundary.positions.shape
+            or self.reference_support != float(support)
+        )
+        if not rebuild and len(fluid_pos):
+            fluid_move = float(np.linalg.norm(fluid_pos - self.reference_fluid, axis=1).max())
+            wall_move = float(np.linalg.norm(boundary.positions - self.reference_boundary, axis=1).max()) if len(boundary.positions) else 0.0
+            # Triangle inequality: even rotating walls cannot enter support
+            # from outside the candidate radius before this bound is reached.
+            rebuild = fluid_move + wall_move >= self.skin
+        if rebuild:
+            radius = float(support) + self.skin
+            self.candidate_i, self.candidate_j = build_cross_neighbor_pairs(
+                fluid_pos, boundary.positions, radius
+            )
+            self.reference_fluid = fluid_pos.copy()
+            self.reference_boundary = boundary.positions.copy()
+            self.reference_support = float(support)
+        if not len(self.candidate_i):
+            return self.candidate_i, self.candidate_j
+        # Candidate lists include the Verlet skin and may be much larger than
+        # the exact interaction list. Filter in bounded blocks to avoid several
+        # simultaneous Mx3 temporaries (fluid positions, wall positions, rij).
+        support2 = float(support) ** 2
+        kept_i = []
+        kept_j = []
+        for start in range(0, len(self.candidate_i), _WALL_PAIR_CHUNK):
+            end = min(start + _WALL_PAIR_CHUNK, len(self.candidate_i))
+            candidate_i = self.candidate_i[start:end]
+            candidate_j = self.candidate_j[start:end]
+            rij = fluid_pos[candidate_i] - boundary.positions[candidate_j]
+            keep = np.einsum("ij,ij->i", rij, rij) < support2
+            if np.any(keep):
+                kept_i.append(candidate_i[keep])
+                kept_j.append(candidate_j[keep])
+        if not kept_i:
+            return np.empty(0, dtype=self.candidate_i.dtype), np.empty(
+                0, dtype=self.candidate_j.dtype
+            )
+        return np.concatenate(kept_i), np.concatenate(kept_j)
 
 
 def build_wall_interactions(
