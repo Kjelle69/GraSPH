@@ -1,5 +1,4 @@
 import math
-import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -654,43 +653,3 @@ def initialize_hydrostatic_density(
     pressure = rho0 * g * depth
     rho = rho0 * (1.0 + pressure / B) ** (1.0 / gamma)
     return rho, pressure
-
-
-if __name__ == "__main__":
-    from grasph_scene import load_scene, generate_fluid_particles
-
-    print()
-    print("========================================")
-    print("GraSPH WCSPH CORE TEST")
-    print("========================================")
-
-    cfg = SPHConfig()
-    scene = load_scene("TankTest.usda")
-    pos = generate_fluid_particles(scene, dp=cfg.dp)
-    vel = np.zeros_like(pos)
-    rho = np.full(len(pos), cfg.rho0, dtype=np.float64)
-    kernel = WendlandC2(cfg.h)
-
-    start = time.perf_counter()
-    pair_i, pair_j = build_neighbor_pairs(pos, cfg.support)
-    elapsed = time.perf_counter() - start
-    counts = neighbor_counts(len(pos), pair_i, pair_j)
-
-    print(f"Unique pairs : {len(pair_i):,}")
-    print(f"Build time   : {elapsed:.4f} s")
-    print(
-        f"Neighbours   : {counts.min()} / "
-        f"{counts.mean():.2f} / {counts.max()}"
-    )
-
-    _, _, gradW = compute_pair_geometry(pos, pair_i, pair_j, kernel)
-    drho = compute_density_rate(vel, pair_i, pair_j, gradW, cfg.mass)
-    pressure = compute_pressure(rho, cfg.rho0, cfg.tait_B, cfg.gamma)
-    acc = compute_pressure_acceleration(
-        rho, pressure, pair_i, pair_j, gradW, cfg.mass
-    )
-
-    print(f"drho max     : {np.max(np.abs(drho)):.6e}")
-    print(f"pressure max : {pressure.max():.6e} Pa")
-    print(f"acc max      : {np.linalg.norm(acc, axis=1).max():.6e} m/s2")
-    print(f"CFL dt       : {compute_cfl_dt(vel, cfg.h, cfg.c0):.8f} s")

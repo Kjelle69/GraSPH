@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 import numpy as np
-from benchmarks.buoyancy_probe import make_scene
+from tests.scene_helpers import make_scene
 from grasph_solver import run_simulation, SolverSettings
 from grasph_sph import SPHConfig
 

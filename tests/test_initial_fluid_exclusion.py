@@ -6,7 +6,7 @@ import unittest
 
 import numpy as np
 from pxr import Usd
-from benchmarks.buoyancy_probe import box
+from tests.scene_helpers import box
 from grasph_scene import load_scene, exclude_solid_fluid_particles
 from grasph_collision import is_closed_triangle_mesh, points_inside_closed_mesh
 

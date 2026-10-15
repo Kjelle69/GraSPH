@@ -3,6 +3,22 @@
 /archive/*.npz
 /archive/*.csv
 
+# Local experiments and assets; the repository contains source and regression tests.
+/archive/
+/benchmarks/
+/examples/
+/textures/
+/video/
+/*.blend
+/*.usd
+/*.usda
+/*.usdc
+/analysis_handoff.py
+/HANDOFF_ANALYSIS.md
+/blender/build_paddle_wheel_scene.py
+/blender/build_surface_scene.py
+/tests/blender_velocity_probe.py
+
 # Python caches and local environments
 __pycache__/
 *.py[cod]

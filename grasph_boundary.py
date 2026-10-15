@@ -1,6 +1,4 @@
 import math
-import os
-import sys
 import time
 from dataclasses import dataclass
 
@@ -9,7 +7,6 @@ import numpy as np
 _WALL_PAIR_CHUNK = 16384
 from pxr import UsdGeom, Gf
 
-from grasph_scene import load_scene, generate_fluid_particles
 from grasph_sph import (
     SPHConfig,
     WendlandC2,
@@ -1473,99 +1470,3 @@ def save_boundary_npz(boundary, output_file):
         payload["pseudo_masses"] = boundary.pseudo_masses.astype(np.float32)
     np.savez_compressed(output_file, **payload)
     print(f"Saved: {output_file}")
-
-
-# ============================================================
-# STANDALONE PREVIEW / SMOKE TEST
-# ============================================================
-
-def main():
-    usd_file = sys.argv[1] if len(sys.argv) > 1 else "TankTest.usda"
-
-    cfg = SPHConfig()
-
-    output_dir = "output"
-    os.makedirs(output_dir, exist_ok=True)
-
-    preview_file = os.path.join(output_dir, "boundary_preview.usdc")
-    npz_file = os.path.join(output_dir, "boundary_particles.npz")
-
-    print()
-    print("========================================")
-    print("GraSPH BOUNDARY PREVIEW v0.5")
-    print("========================================")
-    print(f"Scene   : {usd_file}")
-    print(f"dp      : {cfg.dp:.4f} m")
-    print(f"support : {cfg.support:.4f} m")
-
-    scene = load_scene(usd_file)
-    fluid_pos = generate_fluid_particles(scene, dp=cfg.dp)
-
-    boundary = build_boundary_particles(
-        scene,
-        spacing=cfg.dp,
-    )
-
-    support_data = analyze_boundary_support(
-        fluid_pos,
-        boundary,
-        cfg.support,
-    )
-
-    kernel = WendlandC2(cfg.h)
-    compute_boundary_pseudo_volumes(
-        boundary,
-        kernel,
-        cfg.support,
-        cfg.rho0,
-    )
-
-    analyze_weighted_kernel_support(
-        fluid_pos,
-        boundary,
-        cfg,
-        support_data=support_data,
-    )
-
-    # Runtime choice from v0.4 result: one surface layer gets
-    # half a fluid-cell thickness, Vb = 0.5*dp^3.
-    assign_half_cell_wall_volumes(
-        boundary,
-        cfg.dp,
-        cfg.rho0,
-        thickness_factor=0.5,
-    )
-
-    print()
-    print("========================================")
-    print("RUNTIME WALL VOLUME v0.5")
-    print("========================================")
-    print(f"Vb = 0.5 * dp^3 = {boundary.volumes[0]:.6e} m3")
-    print(f"mb(rho0)       = {boundary.pseudo_masses[0]:.6e} kg")
-
-    save_boundary_npz(boundary, npz_file)
-
-    write_boundary_preview(
-        scene.stage,
-        fluid_pos,
-        boundary,
-        cfg.dp,
-        preview_file,
-    )
-
-    print()
-    print("========================================")
-    print("BOUNDARY PREVIEW READY")
-    print("========================================")
-    print("Open this file in Blender:")
-    print(f"  {preview_file}")
-    print()
-    print("Inspect especially:")
-    print("  - uniform spacing on long/thin faces")
-    print("  - bottom and side-wall coverage")
-    print("  - Gate coverage")
-    print("  - remaining dense bands around edges")
-
-
-if __name__ == "__main__":
-    main()

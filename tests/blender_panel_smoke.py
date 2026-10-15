@@ -16,7 +16,7 @@ spec.loader.exec_module(addon)
 addon.register()
 # Match Blender Text Editor behavior, where __file__ may point at the .blend,
 # and verify that repeated Run Script registration remains safe.
-addon.__file__ = str(root / "examples" / "GranularExample.blend")
+addon.__file__ = str(root / "local_scene.blend")
 addon.register()
 assert Path(addon._default_project_root()) == root
 assert addon._path("//output") == root / "output"
@@ -31,7 +31,7 @@ try:
 finally:
     os.chdir(original_cwd)
     bpy.data.texts.remove(source_text)
-addon.__file__ = str(root / "examples" / "GranularExample.blend")
+addon.__file__ = str(root / "local_scene.blend")
 bpy.context.scene.grasph_scene.project_root = ""
 assert addon._ensure_project_root(bpy.context.scene.grasph_scene) == root
 assert Path(addon._surface_module(bpy.context.scene).__file__).resolve() == (
