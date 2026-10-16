@@ -1,11 +1,11 @@
 """GraSPH scene-authoring and simulation controls for Blender.
 
-Install this file as a legacy add-on, or run it in Blender's Text Editor.
+Install the complete ZIP as a legacy add-on, or run this file in the Text Editor.
 The numerical solver is launched as a separate process; Blender remains the
 scene editor and result viewer.
 """
 
-ADDON_VERSION = (0, 14, 0)
+ADDON_VERSION = (0, 15, 0)
 
 
 bl_info = {
@@ -23,7 +23,6 @@ from pathlib import Path
 import importlib.util
 import math
 import re
-import shlex
 import subprocess
 import sys
 import time
@@ -88,6 +87,8 @@ GRANULAR_MATERIAL_PRESETS = {
 
 _RUNNING = None
 _RESET_REQUESTED = False
+_ENV_JOB = None
+_ENVIRONMENT_MODULE = None
 
 
 def _tail_solver_log(log_file):
@@ -415,8 +416,10 @@ def _discover_project_root():
         starts.append(Path(__file__).resolve())
     except (NameError, OSError):
         pass
-    if bpy.data.filepath:
-        starts.append(Path(bpy.data.filepath).resolve())
+    # Blender restricts bpy.data while importing an installed add-on.
+    blend_path = getattr(bpy.data, "filepath", "")
+    if blend_path:
+        starts.append(Path(blend_path).resolve())
     # When this script is run from Blender's Text Editor, __file__ may be
     # undefined (or point to the saved .blend). Text datablocks retain the
     # source file path, which is the reliable project anchor in that workflow.
@@ -448,6 +451,13 @@ def _default_project_root():
 
 def _ensure_project_root(settings):
     """Populate an empty/stale scene path from the active GraSPH installation."""
+    # An installed package must not keep depending on an old development repo
+    # merely because a .blend saved its previous project_root setting.
+    if __package__ and __package__.endswith(".blender"):
+        packaged = _discover_project_root()
+        if packaged is not None:
+            settings.project_root = str(packaged)
+            return packaged
     current = str(getattr(settings, "project_root", "") or "").strip()
     if current:
         try:
@@ -514,6 +524,48 @@ def _companion_module(filename, module_name, scene=None):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _environment_module(scene=None):
+    global _ENVIRONMENT_MODULE
+    if _ENVIRONMENT_MODULE is None:
+        _ENVIRONMENT_MODULE = _companion_module(
+            "grasph_environment.py", "grasph_environment_runtime", scene)
+    return _ENVIRONMENT_MODULE
+
+
+def _solver_python(settings, scene):
+    environment = _environment_module(scene)
+    if not settings.use_managed_environment:
+        return environment.split_python_command(settings.python_command)
+    root = _ensure_project_root(settings)
+    if root is None:
+        raise RuntimeError("GraSPH solver files could not be found")
+    path = environment.environment_path(root, environment.user_data_path())
+    if not environment.is_ready(root, path):
+        raise RuntimeError("Install the solver environment under Solver Installation first")
+    return [str(environment.python_path(path))]
+
+
+def _poll_environment_job():
+    global _ENV_JOB
+    job = _ENV_JOB
+    if job is None:
+        return None
+    result = job["process"].poll()
+    if result is None:
+        return 1.0
+    job["log_handle"].close()
+    scene = bpy.data.scenes.get(job["scene"])
+    if scene is not None and hasattr(scene, "grasph_scene"):
+        settings = scene.grasph_scene
+        settings.environment_status = (
+            "Installation checked: ready" if result == 0 else
+            "Setup/check failed; inspect the installation log")
+    _ENV_JOB = None
+    if bpy.context.screen:
+        _tag_redraw(bpy.context)
+    return None
 
 
 def _surface_module(scene=None):
@@ -1276,6 +1328,16 @@ class GraSPHSceneSettings(PropertyGroup):
         name="Python", default="py" if os.name == "nt" else "python3",
         description="External Python command containing the GraSPH dependencies",
     )
+    use_managed_environment: BoolProperty(
+        name="Managed Solver Environment", default=bool(__package__ and __package__.endswith(".blender")),
+        description="Use GraSPH's isolated solver venv, outside Blender and the model directory",
+    )
+    bootstrap_python: StringProperty(
+        name="Setup Python", default="py -3.13" if os.name == "nt" else "python3.13",
+        description="Installed 64-bit CPython 3.13 used to create the managed venv",
+    )
+    environment_status: StringProperty(name="Installation Status", default="Not checked", options={"SKIP_SAVE"})
+    environment_log: StringProperty(name="Installation Log", subtype="FILE_PATH", options={"SKIP_SAVE"})
     sim_time: FloatProperty(name="Time (s)", default=1.0, min=1.0e-6)
     restart_npz: StringProperty(
         name="Continue From", subtype="FILE_PATH", default="",
@@ -1291,6 +1353,13 @@ class GraSPHSceneSettings(PropertyGroup):
     )
     dp: FloatProperty(name="Particle Spacing (m)", default=0.05, min=1.0e-6)
     c0: FloatProperty(name="Sound Speed (m/s)", default=20.0, min=1.0e-6)
+    enable_diagnostics: BoolProperty(name="Sample Force Diagnostics", default=False,
+        description="Log selected particle forces without changing physics; adds diagnostic overhead")
+    diagnostics_start: FloatProperty(name="Diagnostics From (s)", default=0.5, min=0.)
+    diagnostics_end: FloatProperty(name="Diagnostics To (s)", default=1.5, min=0.)
+    diagnostics_interval: FloatProperty(name="Diagnostic Interval (s)", default=0.01, min=0.000001, precision=4)
+    diagnostics_ids: StringProperty(name="Track Particle IDs", default="",
+        description="Optional comma-separated persistent IDs; fastest particles are also logged")
     output_fps: FloatProperty(name="Output FPS", default=30.0, min=0.1)
     output_dir: StringProperty(name="Output Folder", subtype="DIR_PATH", default="//output")
     output_name: StringProperty(name="Result Name", default="grasph_result")
@@ -1576,6 +1645,84 @@ class GRASPH_OT_export(Operator):
         return {"FINISHED"}
 
 
+class GRASPH_OT_solver_environment(Operator):
+    bl_idname = "grasph.solver_environment"
+    bl_label = "Solver Environment"
+    action: EnumProperty(items=(("INSTALL", "Install", "Create/install managed solver dependencies"),
+                                ("CHECK", "Check", "Check selected solver environment")))
+
+    @classmethod
+    def poll(cls, context):
+        return _RUNNING is None and _ENV_JOB is None
+
+    def invoke(self, context, event):
+        if self.action == "INSTALL":
+            return context.window_manager.invoke_props_dialog(self, width=460)
+        return self.execute(context)
+
+    def draw(self, context):
+        self.layout.label(text="Create/update GraSPH's isolated solver environment?")
+        self.layout.label(text="Downloads NumPy, SciPy and USD wheels from PyPI.")
+        self.layout.label(text="Needs internet and installed 64-bit CPython 3.13.")
+        self.layout.label(text="Blender's Python is not modified.")
+
+    def execute(self, context):
+        global _ENV_JOB
+        settings = context.scene.grasph_scene
+        log_handle = None
+        try:
+            root = _ensure_project_root(settings)
+            if root is None:
+                raise RuntimeError("GraSPH solver files could not be found")
+            environment = _environment_module(context.scene)
+            path = environment.environment_path(root, environment.user_data_path())
+            if self.action == "INSTALL":
+                if not settings.use_managed_environment:
+                    raise RuntimeError("Enable Managed Solver Environment before installing")
+                python = environment.split_python_command(settings.bootstrap_python)
+            elif settings.use_managed_environment:
+                if not environment.python_path(path).is_file():
+                    raise RuntimeError("Install the managed solver environment first")
+                python = [str(environment.python_path(path))]
+            else:
+                python = environment.split_python_command(settings.python_command)
+            command = python + [str(root / "blender" / "grasph_environment.py"),
+                                self.action.lower(), "--root", str(root)]
+            if settings.use_managed_environment:
+                command += ["--environment", str(path)]
+            logs = environment.user_data_path() / "logs"
+            logs.mkdir(parents=True, exist_ok=True)
+            log = logs / f"setup-{time.time_ns()}-{os.getpid()}.log"
+            log_handle = log.open("w", encoding="utf-8")
+            process = subprocess.Popen(
+                command, cwd=str(root), stdout=log_handle, stderr=subprocess.STDOUT,
+                env=environment.child_environment(),
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+            _ENV_JOB = {"process": process, "log_handle": log_handle, "scene": context.scene.name}
+            settings.environment_log = str(log)
+            settings.environment_status = "Installing..." if self.action == "INSTALL" else "Checking..."
+            bpy.app.timers.register(_poll_environment_job, first_interval=1.0)
+        except (OSError, RuntimeError, ValueError) as error:
+            if log_handle is not None:
+                log_handle.close()
+            settings.environment_status = str(error)
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class GRASPH_OT_open_environment_log(Operator):
+    bl_idname = "grasph.open_environment_log"
+    bl_label = "Open Installation Log"
+
+    def execute(self, context):
+        path = context.scene.grasph_scene.environment_log
+        if not path or not Path(path).is_file():
+            return {"CANCELLED"}
+        bpy.ops.wm.path_open(filepath=path)
+        return {"FINISHED"}
+
+
 class GRASPH_OT_run(Operator):
     bl_idname = "grasph.run_simulation"
     bl_label = "Run Simulation"
@@ -1589,7 +1736,7 @@ class GRASPH_OT_run(Operator):
 
     def execute(self, context):
         global _RUNNING
-        if _RUNNING is not None:
+        if _RUNNING is not None or _ENV_JOB is not None:
             self.report({"ERROR"}, "Wait for the current simulation to finish or reset")
             return {"CANCELLED"}
         settings = context.scene.grasph_scene
@@ -1599,6 +1746,11 @@ class GRASPH_OT_run(Operator):
                 {"ERROR"},
                 "GraSPH project folder was not detected. Choose the folder containing grasph.py.",
             )
+            return {"CANCELLED"}
+        try:
+            solver_python = _solver_python(settings, context.scene)
+        except (OSError, RuntimeError, ValueError) as error:
+            self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
         solver = root / "grasph.py"
         output_dir = _path(settings.output_dir)
@@ -1670,7 +1822,7 @@ class GRASPH_OT_run(Operator):
         settings.run_status = "Starting"
         settings.run_message = "Launching external solver…"
         settings.run_elapsed = "00:00"
-        command = shlex.split(settings.python_command, posix=os.name != "nt") + [
+        command = solver_python + [
             str(solver), str(source),
             "--time", str(settings.sim_time),
             "--dp", str(settings.dp),
@@ -1713,6 +1865,11 @@ class GRASPH_OT_run(Operator):
             command.append("--no-wall-continuity")
         if settings.enable_solid_coupling:
             command.append("--solid-coupling")
+        if settings.enable_diagnostics:
+            command.extend(["--diagnostics", "--diagnostics-start", str(settings.diagnostics_start),
+                            "--diagnostics-end", str(settings.diagnostics_end),
+                            "--diagnostics-interval", str(settings.diagnostics_interval),
+                            "--diagnostics-ids", settings.diagnostics_ids])
         try:
             self._log_handle = open(log_file, "w", encoding="utf-8")
             startup = None
@@ -1722,7 +1879,7 @@ class GRASPH_OT_run(Operator):
             _RUNNING = subprocess.Popen(
                 command, cwd=str(root), stdout=self._log_handle,
                 stderr=subprocess.STDOUT, startupinfo=startup,
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                env=_environment_module(context.scene).child_environment(),
             )
         except Exception as error:
             if self._log_handle:
@@ -2184,6 +2341,34 @@ class GRASPH_PT_simulation(Panel):
         layout.prop(settings, "create_surface")
 
 
+class GRASPH_PT_installation(Panel):
+    bl_label = "Solver Installation"
+    bl_idname = "GRASPH_PT_installation"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "GraSPH"
+    bl_parent_id = "GRASPH_PT_simulation"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        settings = context.scene.grasph_scene
+        layout = self.layout
+        controls = layout.column()
+        controls.enabled = _RUNNING is None and _ENV_JOB is None
+        controls.prop(settings, "use_managed_environment")
+        if settings.use_managed_environment:
+            controls.prop(settings, "bootstrap_python")
+            controls.operator("grasph.solver_environment", text="Install Solver Environment",
+                              icon="IMPORT").action = "INSTALL"
+            controls.label(text="Requires CPython 3.13 (64-bit) and internet")
+        else:
+            controls.prop(settings, "python_command")
+        controls.operator("grasph.solver_environment", text="Check Installation", icon="CHECKMARK").action = "CHECK"
+        layout.label(text=settings.environment_status)
+        if settings.environment_log:
+            layout.operator("grasph.open_environment_log", icon="TEXT")
+
+
 class GRASPH_PT_project(Panel):
     bl_label = "Project & Scene"
     bl_idname = "GRASPH_PT_project"
@@ -2246,7 +2431,8 @@ class GRASPH_PT_output_preview(Panel):
         output.prop(settings, "output_fps")
         output.prop(settings, "output_dir")
         output.prop(settings, "output_name")
-        output.prop(settings, "python_command")
+        if not settings.use_managed_environment:
+            output.prop(settings, "python_command")
 
         preview = layout.box()
         preview.label(text="Live Viewport Preview", icon="VIEW_CAMERA")
@@ -2310,6 +2496,14 @@ class GRASPH_PT_advanced(Panel):
         layout.prop(settings, "wall_search")
         layout.prop(settings, "granular_dt")
         layout.prop(settings, "granular_iterations")
+        diagnostics = layout.box()
+        diagnostics.prop(settings, "enable_diagnostics")
+        if settings.enable_diagnostics:
+            diagnostics.prop(settings, "diagnostics_start")
+            diagnostics.prop(settings, "diagnostics_end")
+            diagnostics.prop(settings, "diagnostics_interval")
+            diagnostics.prop(settings, "diagnostics_ids")
+            diagnostics.label(text="Sampled forces only; simulation physics unchanged")
 
 
 class GRASPH_PT_validation(Panel):
@@ -2432,6 +2626,8 @@ CLASSES = (
     GRASPH_OT_granular_material_preset,
     GRASPH_OT_validate,
     GRASPH_OT_export,
+    GRASPH_OT_solver_environment,
+    GRASPH_OT_open_environment_log,
     GRASPH_OT_run,
     GRASPH_OT_stop,
     GRASPH_OT_toggle_pause,
@@ -2442,6 +2638,7 @@ CLASSES = (
     GRASPH_OT_refresh_granular_display,
     GRASPH_PT_entities,
     GRASPH_PT_simulation,
+    GRASPH_PT_installation,
     GRASPH_PT_project,
     GRASPH_PT_output_preview,
     GRASPH_PT_advanced,

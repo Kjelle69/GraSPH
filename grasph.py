@@ -52,7 +52,18 @@ def main():
                    help="Atomically updated partial USD animation path")
     p.add_argument("--usd-checkpoint-interval", type=float, default=0.10,
                    help="Partial USD write interval as a fraction of total time")
+    p.add_argument("--diagnostics", action="store_true", help="Write sampled force diagnostics alongside results")
+    p.add_argument("--diagnostics-start", type=float, default=0.5)
+    p.add_argument("--diagnostics-end", type=float, default=1.5)
+    p.add_argument("--diagnostics-interval", type=float, default=0.01, help="Simulation seconds between samples")
+    p.add_argument("--diagnostics-ids", default="", help="Comma-separated persistent fluid particle IDs to follow")
     args = p.parse_args()
+    try:
+        diagnostics_ids = tuple(int(i.strip()) for i in args.diagnostics_ids.split(",") if i.strip())
+        if any(i < 0 for i in diagnostics_ids):
+            raise ValueError
+    except ValueError:
+        p.error("--diagnostics-ids must contain nonnegative integers separated by commas")
 
     if args.inspect_motion:
         load_scene(args.usd)
@@ -86,6 +97,11 @@ def main():
         control_file=args.control_file,
         usd_checkpoint_file=args.usd_checkpoint,
         usd_checkpoint_interval=max(0.01, min(1.0, args.usd_checkpoint_interval)),
+        enable_diagnostics=args.diagnostics,
+        diagnostics_start=args.diagnostics_start,
+        diagnostics_end=args.diagnostics_end,
+        diagnostics_interval=args.diagnostics_interval,
+        diagnostics_ids=diagnostics_ids,
     )
     run_simulation(args.usd, sph_cfg=cfg, settings=settings)
 

@@ -18,7 +18,7 @@ _NEIGHBOR_WORKERS = -1
 # Keep pairwise temporary arrays bounded.  A few million interactions can be
 # valid for a scene, but materialising an Mx3 force array in one go can fail on
 # Windows long before the solver's particle arrays are themselves exhausted.
-_PAIR_WORK_CHUNK = 8192
+_PAIR_WORK_CHUNK = 65536
 
 def configure_neighbor_search(backend="auto", workers=-1):
     """Configure neighbour search globally for the NumPy solver.
@@ -123,18 +123,16 @@ class WendlandC2:
     def gradW(self, rij, r):
         rij = np.asarray(rij, dtype=np.float64)
         r = np.asarray(r, dtype=np.float64)
-        grad = np.zeros_like(rij)
-
         active = (r > 1e-12) & (r < self.support)
         if not np.any(active):
-            return grad
+            return np.zeros_like(rij)
 
-        ra = r[active]
-        q = ra / self.h
-        a = 1.0 - 0.5 * q
-        dWdr = -5.0 * self.alpha * q * a**3 / self.h
-        grad[active] = dWdr[:, None] * rij[active] / ra[:, None]
-        return grad
+        # q / (h * r) = 1 / h**2.  Evaluate the radial coefficient
+        # directly: no masked copies of the Mx3 positions or vector division.
+        a = np.maximum(1.0 - 0.5 * r / self.h, 0.0)
+        scale = (-5.0 * self.alpha / self.h**2) * a**3
+        scale[~active] = 0.0
+        return rij * scale[:, None]
 
 
 HALF_NEIGHBOR_OFFSETS = []
@@ -440,14 +438,14 @@ class TranslationNeighborSearch:
 
 def compute_pair_geometry(pos, pair_i, pair_j, kernel):
     rij = pos[pair_i] - pos[pair_j]
-    r = np.linalg.norm(rij, axis=1)
+    r = np.sqrt(np.einsum("ij,ij->i", rij, rij))
     gradW = kernel.gradW(rij, r)
     return rij, r, gradW
 
 
 def compute_cross_pair_geometry(fluid_pos, other_pos, pair_i, pair_j, kernel):
     rij = fluid_pos[pair_i] - other_pos[pair_j]
-    r = np.linalg.norm(rij, axis=1)
+    r = np.sqrt(np.einsum("ij,ij->i", rij, rij))
     gradW = kernel.gradW(rij, r)
     return rij, r, gradW
 
@@ -478,10 +476,10 @@ def fluid_connected_components(n_particles, pair_i, pair_j):
     jj = np.asarray(pair_j, dtype=np.int32)
 
     if _scipy_sparse is not None and _scipy_connected_components is not None:
-        rows = np.concatenate((ii, jj))
-        cols = np.concatenate((jj, ii))
-        data = np.ones(len(rows), dtype=np.uint8)
-        graph = _scipy_sparse.csr_matrix((data, (rows, cols)), shape=(n, n))
+        # directed=False traverses both directions itself.  Storing each edge
+        # once avoids constructing and sorting an explicitly doubled graph.
+        data = np.ones(len(ii), dtype=np.uint8)
+        graph = _scipy_sparse.csr_matrix((data, (ii, jj)), shape=(n, n))
         ncomp, labels = _scipy_connected_components(
             graph, directed=False, return_labels=True
         )
@@ -545,8 +543,8 @@ def compute_density_rate(vel, pair_i, pair_j, gradW, mass):
     vij = vel[pair_i] - vel[pair_j]
     pair_term = mass * np.einsum("ij,ij->i", vij, gradW)
 
-    np.add.at(drho, pair_i, pair_term)
-    np.add.at(drho, pair_j, pair_term)
+    drho += np.bincount(pair_i, weights=pair_term, minlength=n)
+    drho += np.bincount(pair_j, weights=pair_term, minlength=n)
     return drho
 
 
@@ -565,15 +563,14 @@ def compute_pressure_acceleration(
     n = len(rho)
     acc = np.zeros((n, 3), dtype=np.float64)
     pair_count = len(pair_i)
+    # This coefficient belongs to a particle, not an interaction.  Compute it
+    # once per particle instead of repeating division for every neighbour.
+    coefficient = pressure / (rho * rho)
     for start in range(0, pair_count, _PAIR_WORK_CHUNK):
         end = min(start + _PAIR_WORK_CHUNK, pair_count)
         pi_idx = pair_i[start:end]
         pj_idx = pair_j[start:end]
-        rhoi = rho[pi_idx]
-        rhoj = rho[pj_idx]
-        pi = pressure[pi_idx]
-        pj = pressure[pj_idx]
-        pressure_factor = mass * (pi / (rhoi * rhoi) + pj / (rhoj * rhoj))
+        pressure_factor = mass * (coefficient[pi_idx] + coefficient[pj_idx])
         pair_force = pressure_factor[:, None] * gradW[start:end]
         acc += _scatter_add_vec3(
             n, pi_idx, -pair_force, pj_idx, pair_force

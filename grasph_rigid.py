@@ -119,6 +119,168 @@ def _oriented_surface_query(points, triangles):
     return signed_distance, best_normal
 
 
+def _unique_axes(vectors):
+    vectors = np.asarray(vectors, dtype=np.float64).reshape(-1, 3)
+    lengths = np.linalg.norm(vectors, axis=1)
+    axes = vectors[lengths > 1e-10] / lengths[lengths > 1e-10, None]
+    if not len(axes):
+        return axes
+    leading = np.argmax(np.abs(axes) > 1e-10, axis=1)
+    axes *= np.where(axes[np.arange(len(axes)), leading] < 0, -1., 1.)[:, None]
+    _, indices = np.unique(np.round(axes, 10), axis=0, return_index=True)
+    return axes[indices]
+
+
+def _convex_features(collider):
+    """Cache reference-pose vertices, face axes and actual (non-diagonal) edges."""
+    cached = getattr(collider, '_rigid_convex_features', None)
+    if cached is not None:
+        return cached
+    triangles = np.asarray(collider.triangles, dtype=np.float64)
+    vertices, indices = np.unique(triangles.reshape(-1, 3), axis=0, return_inverse=True)
+    normals = np.cross(triangles[:, 1]-triangles[:, 0], triangles[:, 2]-triangles[:, 0])
+    lengths = np.linalg.norm(normals, axis=1)
+    normals = normals / np.maximum(lengths[:, None], 1e-30)
+    adjacency = {}
+    for face, corners in enumerate(indices.reshape(-1, 3)):
+        for a, b in zip(corners, np.roll(corners, -1)):
+            adjacency.setdefault(tuple(sorted((int(a), int(b)))), []).append(face)
+    edges = []
+    for (a, b), faces in adjacency.items():
+        if len(faces) > 1 and all(abs(np.dot(normals[faces[0]], normals[f])) > 1-1e-9 for f in faces[1:]):
+            continue  # Internal triangulation of a planar convex face.
+        edges.append(vertices[b]-vertices[a])
+    cached = vertices, _unique_axes(normals), _unique_axes(edges)
+    collider._rigid_convex_features = cached
+    return cached
+
+
+def _hull2(points):
+    points = sorted(set(map(tuple, np.asarray(points))))
+    if len(points) <= 2:
+        return np.asarray(points)
+    def cross(a, b, c):
+        u, v = np.asarray(b)-a, np.asarray(c)-a
+        return u[0]*v[1]-u[1]*v[0]
+    lower, upper = [], []
+    for target, sequence in ((lower, points), (upper, reversed(points))):
+        for point in sequence:
+            while len(target) >= 2 and cross(target[-2], target[-1], point) <= 1e-14:
+                target.pop()
+            target.append(point)
+    return np.asarray(lower[:-1]+upper[:-1])
+
+
+def _support_contact_point(a, b, normal):
+    """Centroid of projected supporting-feature overlap (face/edge/vertex)."""
+    pa, pb = a @ normal, b @ normal
+    tolerance = 1e-8 * max(1., np.ptp(pa), np.ptp(pb))
+    fa, fb = a[pa <= pa.min()+tolerance], b[pb >= pb.max()-tolerance]
+    helper = np.eye(3)[np.argmin(abs(normal))]
+    u = np.cross(normal, helper); u /= np.linalg.norm(u)
+    v = np.cross(normal, u)
+    basis = np.column_stack((u, v))
+    aa, bb = _hull2(fa @ basis), _hull2(fb @ basis)
+    # Clip a convex polygon/segment/point against the other supporting face.
+    subject, clip = (aa, bb) if len(bb) >= 3 else (bb, aa)
+    if len(clip) >= 3:
+        polygon = list(subject)
+        for start, end in zip(clip, np.roll(clip, -1, axis=0)):
+            edge = end-start
+            def side(p):
+                d = p-start
+                return edge[0]*d[1]-edge[1]*d[0]
+            previous_polygon, polygon = polygon, []
+            if not previous_polygon:
+                break
+            previous = previous_polygon[-1]; sp = side(previous)
+            for current in previous_polygon:
+                sc = side(current)
+                if (sc >= -1e-12) != (sp >= -1e-12):
+                    polygon.append(previous + sp/(sp-sc)*(current-previous))
+                if sc >= -1e-12:
+                    polygon.append(current)
+                previous, sp = current, sc
+        if polygon:
+            tangent = np.mean(np.unique(np.round(polygon, 12), axis=0), axis=0)
+            return basis @ tangent + .5*(pa.min()+pb.max())*normal
+    # Degenerate edge-edge/vertex contacts, or disjoint inflated features.
+    # Closest projected segments also cover point segments (zero length).
+    best, tangent = np.inf, .5*(aa.mean(axis=0)+bb.mean(axis=0))
+    for x, y in zip(aa, np.roll(aa, -1, axis=0)):
+        for z, w in zip(bb, np.roll(bb, -1, axis=0)):
+            # Endpoint projections cover parallel edges; the crossing case
+            # supplies the interior-interior witness.
+            candidates = []
+            for p, q, r in ((x,z,w), (y,z,w), (z,x,y), (w,x,y)):
+                edge = r-q
+                closest = q + np.clip(np.dot(p-q, edge)/max(np.dot(edge,edge),1e-30),0,1)*edge
+                candidates.append((p, closest))
+            e, f = y-x, w-z
+            determinant = e[0]*f[1]-e[1]*f[0]
+            if abs(determinant) > 1e-14:
+                delta = z-x
+                s = (delta[0]*f[1]-delta[1]*f[0])/determinant
+                t = (delta[0]*e[1]-delta[1]*e[0])/determinant
+                if 0 <= s <= 1 and 0 <= t <= 1:
+                    candidates.append((x+s*e, z+t*f))
+            for p, q in candidates:
+                distance = np.dot(p-q,p-q)
+                if distance < best:
+                    best, tangent = distance, .5*(p+q)
+    return basis @ tangent + .5*(pa.min()+pb.max())*normal
+
+
+def _convex_pair_contact(body, state, collider, other_body, other_state, other_collider):
+    """Complete polyhedral SAT, including edge-edge axes and containment.
+
+    Returns B-to-A separating normal, translation depth including authored
+    margins, and a supporting-feature contact point. Authored meshes must be convex.
+    """
+    va, na, ea = _convex_features(collider)
+    vb, nb, eb = _convex_features(other_collider)
+    ra, rb = state['rotation'], other_state['rotation']
+    a = body.center + state['translation'] + (va-body.center) @ ra.T
+    b = other_body.center + other_state['translation'] + (vb-other_body.center) @ rb.T
+    margin = body.collision_margin + other_body.collision_margin
+    if np.any(a.max(axis=0)+margin < b.min(axis=0)) or np.any(b.max(axis=0)+margin < a.min(axis=0)):
+        return None
+    cross_axes = np.cross((ea @ ra.T)[:,None,:], (eb @ rb.T)[None,:,:]).reshape(-1,3)
+    axes = _unique_axes(np.vstack((na @ ra.T, nb @ rb.T, cross_axes)))
+    if not len(axes):
+        return None
+    # Shift projections near the origin to keep tolerance independent of
+    # a scene's world-space translation.
+    origin = .5*(a.mean(axis=0)+b.mean(axis=0))
+    pa, pb = (a-origin) @ axes.T, (b-origin) @ axes.T
+    forward = pb.max(axis=0)-pa.min(axis=0)+margin
+    backward = pa.max(axis=0)-pb.min(axis=0)+margin
+    depth = np.minimum(forward, backward)
+    if np.any(depth <= 1e-10):
+        return None
+    index = int(np.argmin(depth))
+    normal = axes[index] if forward[index] <= backward[index] else -axes[index]
+    point = _support_contact_point(a-origin,b-origin,normal)+origin
+    return normal, float(depth[index]), point
+
+
+def _inverse_translation_mass(body):
+    joint = getattr(body, 'joint_type', 'free')
+    if joint == 'fixed':
+        return np.zeros((3,3))
+    if joint == 'prismatic':
+        axis = np.asarray(body.joint_axis, dtype=np.float64)
+        axis = axis/np.linalg.norm(axis)
+        return np.outer(axis,axis)/body.mass
+    return np.eye(3)/body.mass
+
+
+def _inverse_rotation_inertia(body, state):
+    if getattr(body, 'joint_type', 'free') in {'fixed', 'prismatic'}:
+        return np.zeros((3,3))
+    return np.linalg.inv(world_inertia(body,state))
+
+
 def resolve_body_contacts(
     scene, colliders, body_states, collider_translations, collider_velocities,
     collider_rotations, collider_centers, collider_angular_velocities,
@@ -126,16 +288,18 @@ def resolve_body_contacts(
 ):
     """Resolve convex dynamic bodies against static, kinematic and dynamic meshes.
 
-    Convex bodies use authored mesh vertices, edge midpoints and face centroids.
-    One deepest sample is solved per collider and iteration. Equal-and-opposite
+    Convex body pairs use complete polyhedral SAT, not sampled surface tests.
+    Static/kinematic meshes retain finite-feature sampled contacts. Equal-and-opposite
     impulses are applied immediately when the other collider is dynamic; hinge
-    reaction impulses are returned to the caller.
+    reaction impulses are returned to the caller. Additional bounded sweeps
+    recover deep/multiple contacts, with early exit at sub-micrometre corrections.
     """
     collider_by_name = {collider.name: collider for collider in colliders}
     angular_reactions = {}
     contacts = 0
 
-    for _ in range(max(1, int(iterations))):
+    for sweep in range(max(32, int(iterations))):
+        largest_correction = 0.0
         for path, state in body_states.items():
             body = scene.dynamic_bodies[path]
             if getattr(body, "joint_type", "free") == "fixed":
@@ -170,25 +334,56 @@ def resolve_body_contacts(
                 other_center = np.asarray(
                     collider_centers.get(other_path, np.zeros(3)), dtype=np.float64
                 )
-                relative = samples - other_translation[None, :] - other_center[None, :]
-                query = other_center[None, :] + relative @ other_rotation
-                distance, normal_local = _oriented_surface_query(
-                    query, collider.triangles
-                )
-                penetration = effective_radius - distance
-                candidate = np.where(penetration > 0.0)[0]
-                if not len(candidate):
-                    continue
-                deepest = candidate[int(np.argmax(penetration[candidate]))]
-                normal = normal_local[deepest] @ other_rotation.T
-                normal_length = float(np.linalg.norm(normal))
-                if normal_length < 0.5:
-                    continue
-                normal /= normal_length
-                depth = float(penetration[deepest])
-                state["translation"] += normal * depth
-                samples += normal[None, :] * depth
-                point = samples[deepest] - normal * effective_radius
+                posed_other = body_states.get(other_path)
+                if posed_other is not None:
+                    # Contact iterations change poses in place. The dictionaries
+                    # passed by the integrator are snapshots from before those
+                    # corrections and must not be used for another dynamic body.
+                    other_translation = posed_other['translation']
+                    other_rotation = posed_other['rotation']
+                    other_center = scene.dynamic_bodies[other_path].center
+                inv_translation = _inverse_translation_mass(body)
+                other_inv_translation = (np.zeros((3,3)) if posed_other is None else
+                                         _inverse_translation_mass(scene.dynamic_bodies[other_path]))
+                convex_pair = (posed_other is not None and body.collision_shape == 'convex'
+                               and scene.dynamic_bodies[other_path].collision_shape == 'convex'
+                               and path in collider_by_name)
+                if convex_pair:
+                    contact = _convex_pair_contact(
+                        body, state, collider_by_name[path], scene.dynamic_bodies[other_path],
+                        posed_other, collider)
+                    if contact is None:
+                        continue
+                    normal, depth, point = contact
+                else:
+                    relative = samples - other_translation[None, :] - other_center[None, :]
+                    query = other_center[None, :] + relative @ other_rotation
+                    distance, normal_local = _oriented_surface_query(query, collider.triangles)
+                    penetration = effective_radius - distance
+                    candidate = np.where(penetration > 0.0)[0]
+                    if not len(candidate):
+                        continue
+                    deepest = candidate[int(np.argmax(penetration[candidate]))]
+                    normal = normal_local[deepest] @ other_rotation.T
+                    normal_length = float(np.linalg.norm(normal))
+                    if normal_length < 0.5:
+                        continue
+                    normal /= normal_length
+                    depth = float(penetration[deepest])
+                    point = samples[deepest] - normal * effective_radius
+                separation_mass = float(normal @ (inv_translation+other_inv_translation) @ normal)
+                if separation_mass > 1e-14:
+                    shift = (inv_translation @ normal) * (depth/separation_mass)
+                    other_shift = -(other_inv_translation @ normal) * (depth/separation_mass)
+                    largest_correction = max(largest_correction, np.linalg.norm(shift), np.linalg.norm(other_shift))
+                    state['translation'] += shift
+                    samples += shift
+                    if posed_other is not None:
+                        posed_other['translation'] += other_shift
+                    if convex_pair:
+                        point += .5*(shift+other_shift)
+                    else:
+                        point += shift
                 center = body.center + state["translation"]
                 lever = point - center
 
@@ -220,16 +415,15 @@ def resolve_body_contacts(
                 if vn >= 0.0:
                     continue
 
-                inv_inertia = np.linalg.inv(world_inertia(body, state))
-                inv_mass = 1.0 / body.mass
-                denominator = inv_mass + float(np.dot(
+                inv_inertia = _inverse_rotation_inertia(body, state)
+                denominator = float(normal @ inv_translation @ normal) + float(np.dot(
                     normal, np.cross(inv_inertia @ np.cross(lever, normal), lever)
                 ))
                 other_inv_inertia = None
                 if other_state is not None:
                     other_body = scene.dynamic_bodies[other_path]
-                    other_inv_inertia = np.linalg.inv(world_inertia(other_body, other_state))
-                    denominator += 1.0 / other_body.mass + float(np.dot(
+                    other_inv_inertia = _inverse_rotation_inertia(other_body, other_state)
+                    denominator += float(normal @ other_inv_translation @ normal) + float(np.dot(
                         normal,
                         np.cross(
                             other_inv_inertia @ np.cross(wall_lever, normal),
@@ -242,6 +436,8 @@ def resolve_body_contacts(
                     denominator += float(np.dot(arm_cross_n, hinge.axis)) ** 2 / hinge.moment_of_inertia
 
                 wall_material = scene.collider_materials.get(other_path, {})
+                if denominator < 1e-14:
+                    continue
                 restitution = np.sqrt(max(
                     0.0,
                     float(body_material.get("restitution", 0.1))
@@ -254,7 +450,7 @@ def resolve_body_contacts(
                 tangent_speed = float(np.linalg.norm(tangent))
                 if tangent_speed > 1.0e-12:
                     tangent_direction = tangent / tangent_speed
-                    tangent_denominator = inv_mass + float(np.dot(
+                    tangent_denominator = float(tangent_direction @ inv_translation @ tangent_direction) + float(np.dot(
                         tangent_direction,
                         np.cross(
                             inv_inertia @ np.cross(lever, tangent_direction), lever
@@ -262,7 +458,7 @@ def resolve_body_contacts(
                     ))
                     if other_state is not None:
                         other_body = scene.dynamic_bodies[other_path]
-                        tangent_denominator += 1.0 / other_body.mass + float(np.dot(
+                        tangent_denominator += float(tangent_direction @ other_inv_translation @ tangent_direction) + float(np.dot(
                             tangent_direction,
                             np.cross(
                                 other_inv_inertia @ np.cross(wall_lever, tangent_direction),
@@ -280,17 +476,20 @@ def resolve_body_contacts(
                     )
                     impulse -= tangent_size * tangent_direction
 
-                state["velocity"] += impulse / body.mass
+                state["velocity"] += inv_translation @ impulse
                 state["omega"] += inv_inertia @ np.cross(lever, impulse)
                 reaction = -impulse
                 reaction_torque = np.cross(wall_lever, reaction)
                 if other_state is not None:
                     other_body = scene.dynamic_bodies[other_path]
-                    other_state["velocity"] += reaction / other_body.mass
+                    other_state["velocity"] += other_inv_translation @ reaction
                     other_state["omega"] += other_inv_inertia @ reaction_torque
                 elif other_path in scene.hinges:
                     angular_reactions[other_path] = (
                         angular_reactions.get(other_path, np.zeros(3)) + reaction_torque
                     )
+
+        if largest_correction < 1e-7 and sweep+1 >= min(2, max(1, int(iterations))):
+            break
 
     return contacts, angular_reactions

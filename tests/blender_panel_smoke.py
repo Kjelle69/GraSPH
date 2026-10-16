@@ -37,7 +37,7 @@ assert addon._ensure_project_root(bpy.context.scene.grasph_scene) == root
 assert Path(addon._surface_module(bpy.context.scene).__file__).resolve() == (
     root / "blender" / "grasph_surface.py"
 ).resolve()
-assert addon.ADDON_VERSION == (0, 14, 0)
+assert addon.ADDON_VERSION == (0, 15, 0)
 scene_settings = bpy.context.scene.grasph_scene
 scene_settings.output_fps = 30.0
 bpy.context.scene.frame_start = 1

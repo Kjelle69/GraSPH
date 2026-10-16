@@ -1,12 +1,76 @@
 # Blender controls
 
-Open `grasph_control.py` in Blender's Text Editor and run it. The 3D View's
+Install the complete ZIP, or open `grasph_control.py` in Blender's Text Editor
+and run it for development. The 3D View's
 **GraSPH** sidebar provides scene roles, simulation controls and result display.
 The solver uses the external Python configured under **Output & Preview**.
 Project-root discovery is automatic when the script's location is available;
 **Project & Scene** allows an explicit project directory when needed.
 
+Our normal development workflow remains the Text Editor/repository version
+with an existing external Python environment. Build and test a distribution
+only at meaningful milestones; see the [release workflow](../PLAN.md#release-workflow).
+Do not enable the packaged add-on and run the development controls together
+in the same Blender session. Test distributions in a separate session, and
+wait for any active simulation to finish before changing its installation.
+
+## Packaged installation (Windows)
+
+1. Install 64-bit CPython 3.13 (including the Windows `py` launcher).
+2. Install `GraSPH-0.15.0.zip` using Blender's **Install from Disk** and enable
+   **GraSPH Controls**. This is a self-distributed legacy add-on ZIP, not a
+   Blender Extensions repository submission.
+3. Open **GraSPH > Solver Installation**. Enable **Managed Solver Environment**
+   and leave **Setup Python** as `py -3.13`, or enter the full path to that
+   interpreter. Paths containing spaces are supported.
+4. Click **Install Solver Environment** and confirm the dependency download.
+   Setup runs in a separate process; Blender remains usable. Use
+   **Open Installation Log** for progress and troubleshooting.
+5. Once complete, click **Check Installation**. This loads NumPy, SciPy and USD,
+   exercises native libraries, and checks that the packaged solver starts.
+
+The managed venv lives under `%LOCALAPPDATA%\GraSPH\environments`, with a path
+derived from the packaged requirements. Logs live under `%LOCALAPPDATA%\GraSPH\logs`.
+No packages are installed into Blender's Python. No administrator access is
+needed for these user directories. Setup installs binary wheels from PyPI and
+fails with a log if a compatible wheel or network access is unavailable.
+Enabling the add-on never downloads dependencies automatically.
+
+The first setup needs internet and installed CPython 3.13; normal simulation
+does not. Keep that base Python installed: a venv is not a portable Python
+distribution. Recreate the environment on each machine rather than copying it.
+If requirements change, a new environment is selected; previous environments
+are left intact. No automatic environment deletion is performed. Interrupted
+setup may leave a `.lock` beside the venv: confirm the installer has exited
+before manually removing that lock and retrying.
+
+For an existing Python/venv, disable **Managed Solver Environment**, set
+**Python** to its executable (or command), and click **Check Installation**.
+This checks it without installing or modifying its packages. Development via
+Text Editor defaults to this external-Python mode; the complete installed
+package defaults to managed mode. The choice is saved in the `.blend` file;
+an older file can retain its external-Python choice.
+
+Save each `.blend` wherever you want. `//output` resolves beside that file,
+and the installed package supplies the solver independently of the source repo.
+For an existing GraSPH-authored USD, disable **Export Before Run** and select
+the USD input. Unsaved Blender files still use the solver directory for `//`
+paths: save the model or choose an absolute output folder first.
+
+Developers build the ZIP with `py scripts/build_addon.py`. The explicit file
+list excludes local models, output, tests, venvs and experiments. Test a package
+without network access using Blender's background mode and
+`tests/blender_install_smoke.py`.
+
 ## Scene roles
+
+For targeted fluid debugging, **Advanced Solver Settings > Sample Force
+Diagnostics** enables sampled force traces. Set **Diagnostics From/To (s)**,
+the sampling interval and optional **Track Particle IDs**. The default is off.
+See [fluid force diagnostics](../README.md#fluid-force-diagnostics) for fields,
+units and limitations. Use a separate result name; keep a reference scene and
+its physics settings unchanged. A coupled diagnostic run starts from the
+original scene, not the fluid-only continuation option.
 
 Assign **Fluid Volume**, **Granular Source**, **Static Collider**,
 **Kinematic Collider**, **Dynamic Hinge**, **Dynamic Body**, **Sink / Drain** or

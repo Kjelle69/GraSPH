@@ -19,12 +19,12 @@ class FreeSurfaceConfig:
 def compute_fluid_support_G(n, rho_ref, mass, pair_i, pair_j, gradW):
     G = np.zeros((n, 3), dtype=np.float64)
     if len(pair_i):
-        Vi = mass / np.maximum(rho_ref[pair_i], 1.0e-30)
-        Vj = mass / np.maximum(rho_ref[pair_j], 1.0e-30)
-        G = _scatter_add_vec3(
-            n, pair_i, Vj[:, None] * gradW,
-            pair_j, -Vi[:, None] * gradW,
-        )
+        volume = mass / np.maximum(rho_ref, 1.0e-30)
+        Vi, Vj = volume[pair_i], volume[pair_j]
+        # Reduce one coordinate at a time; avoid two full Mx3 weighted copies.
+        for axis in range(3):
+            G[:, axis] = np.bincount(pair_i, weights=Vj * gradW[:, axis], minlength=n)
+            G[:, axis] += np.bincount(pair_j, weights=-Vi * gradW[:, axis], minlength=n)
     return G
 
 
@@ -178,13 +178,14 @@ def build_seed_connected_band_with_anchor(pos, pair_i, pair_j, air_missing, shel
     if len(pair_i) == 0 or len(shell_idx) == 0:
         return band, anchor, normals
 
-    seed = np.concatenate((pair_i, pair_j)).astype(np.int64, copy=False)
-    cand = np.concatenate((pair_j, pair_i)).astype(np.int64, copy=False)
-    valid = shell_mask[seed] & nz[cand] & (~shell_mask[cand])
-    if not np.any(valid):
+    # Filter before concatenation: only shell-to-interior edges are useful.
+    # Preserve forward-then-reverse ordering, including nearest-seed ties.
+    forward = shell_mask[pair_i] & nz[pair_j] & (~shell_mask[pair_j])
+    reverse = shell_mask[pair_j] & nz[pair_i] & (~shell_mask[pair_i])
+    if not (np.any(forward) or np.any(reverse)):
         return band, anchor, normals
-    seed = seed[valid]
-    cand = cand[valid]
+    seed = np.concatenate((pair_i[forward], pair_j[reverse])).astype(np.int64, copy=False)
+    cand = np.concatenate((pair_j[forward], pair_i[reverse])).astype(np.int64, copy=False)
     rel = pos[cand] - pos[seed]
     inward = np.einsum("ij,ij->i", rel, normals[seed]) <= 1.0e-10
     compatible = np.einsum("ij,ij->i", normals[cand], normals[seed]) >= fs_cfg.normal_compat_dot

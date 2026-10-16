@@ -31,6 +31,7 @@ from grasph_rigid import (
     constrain_body_state,
 )
 from grasph_runtime import wait_if_paused
+from grasph_diagnostics import ForceDiagnostics
 
 
 @dataclass
@@ -66,6 +67,11 @@ class SolverSettings:
     usd_checkpoint_interval: float = 0.10
     restart_npz: str = ""
     restart_time: float = 0.0
+    enable_diagnostics: bool = False
+    diagnostics_start: float = 0.5
+    diagnostics_end: float = 1.5
+    diagnostics_interval: float = 0.01
+    diagnostics_ids: tuple = ()
 
 
 @dataclass
@@ -359,6 +365,16 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
     out_dir = Path(settings.output_dir)
     npz_output = out_dir / f"{stem}.npz"
     usd_output = out_dir / f"{stem}.usdc"
+    diagnostics = None
+    if settings.enable_diagnostics:
+        diagnostics = ForceDiagnostics(
+            out_dir / f"{stem}.diagnostics.jsonl", settings.diagnostics_start,
+            settings.diagnostics_end, settings.diagnostics_interval,
+            watch_ids=settings.diagnostics_ids,
+            metadata={"source": str(Path(usd_file).resolve()), "mass": sph_cfg.mass,
+                      "dp": sph_cfg.dp, "c0": sph_cfg.c0,
+                      "note": "Pre-force state to post-fluid-collision state, before sink filtering; sampled steps only."})
+        print(f"Force diagnostics: {diagnostics.path}")
 
     print("\n========================================")
     print("GraSPH v0.7 - COUPLED SPH + GRANULAR DEM/PBD")
@@ -856,16 +872,35 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
         perf["wall_interactions"] += time.perf_counter() - _tp
         wall_rho_ref, wall_p_ref, _ = hydrostatic_reference_state(boundary.positions, surface_level, sph_cfg, return_depth=True)
 
+        diag_sample = diagnostics is not None and diagnostics.due(t)
+        diag_timings = {}
         _tp = time.perf_counter()
         fs_state = compute_atmospheric_state(
             pos, rho, rho_ref, pair_i, pair_j, gradW,
             boundary, wall_interactions, solid_triangles, solid_normals,
             surface_level, sph_cfg, fs_cfg, active_mask=~detached,
         )
-        perf["free_surface"] += time.perf_counter() - _tp
+        fs_elapsed = time.perf_counter() - _tp
+        perf["free_surface"] += fs_elapsed
+        if diag_sample:
+            diag_timings["free_surface"] = fs_elapsed
+            diag_before = {"position": pos.copy(), "velocity": vel.copy(), "rho": rho.copy(),
+                           "rho_reference": rho_ref.copy(), "reduced_pressure": q.copy(),
+                           "neighbor_count": counts.copy(), "support_hG": fs_state["support_hG"].copy(),
+                           "geometry_normal_rank": fs_state["geom_rank"].copy(),
+                           "blocked_fraction": fs_state["blocked_fraction"].copy(),
+                           "free_surface_reference_pressure": fs_state["p_ref_surface"].copy()}
+            diag_anchors = np.full(n, -1, dtype=np.int32)
+            diag_valid_anchor = fs_state["anchor"] >= 0
+            diag_anchors[diag_valid_anchor] = particle_ids[fs_state["anchor"][diag_valid_anchor]]
+            diag_before["anchor_particle_id"] = diag_anchors
 
         _tp = time.perf_counter()
         acc_q = compute_pressure_acceleration(rho, q, pair_i, pair_j, gradW, sph_cfg.mass)
+        if diag_sample:
+            diag_timings["fluid_pressure"] = time.perf_counter() - _tp
+            diag_fluid_pressure = acc_q.copy()
+            diag_clock = time.perf_counter()
         wall_pair_j = np.empty(0, dtype=np.int32)
         wall_pair_acceleration = np.empty((0, 3), dtype=np.float64)
         if settings.enable_wall_pressure and len(boundary.positions):
@@ -925,20 +960,27 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
                     pressure_body_forces[path] += np.sum(reaction_forces[pair_mask], axis=0)
                     pressure_body_torques[path] += np.sum(torque_vectors, axis=0)
 
+        if diag_sample:
+            diag_timings["wall_pressure_and_body_reaction"] = time.perf_counter() - diag_clock
         acc_base = compute_well_balanced_base_acceleration(rho, rho_ref, depth_ref, sph_cfg.gravity)
+        if diag_sample:
+            diag_clock = time.perf_counter()
         acc_visc = compute_artificial_viscosity_acceleration(
             pos, vel, rho, pair_i, pair_j, rij, r, gradW,
             sph_cfg.mass, sph_cfg.h, sph_cfg.c0,
             alpha=settings.viscosity_alpha,
         )
+        if diag_sample:
+            diag_timings["viscosity"] = time.perf_counter() - diag_clock
         fluid_grain_acc, grain_hydro_acc, fluid_grain_pairs = couple_fluid_grains(
             pos, vel, rho, sph_cfg.mass,
             grain_pos, grain_vel, grain_radii, grain_masses,
             sph_cfg.gravity, sph_cfg.support, dt=dt,
         )
+        hook_acceleration = hooks.acceleration(t)
         acc = (
             acc_q + acc_base + acc_visc + fs_state["acc"]
-            + hooks.acceleration(t)[None, :] + fluid_grain_acc
+            + hook_acceleration[None, :] + fluid_grain_acc
         )
 
         # Symplectic kick -> continuity -> drift. This is the frozen v0.16+
@@ -951,14 +993,25 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
             air_density=settings.detached_air_density,
             drag_coefficient=settings.detached_air_drag_cd,
         )
+        if diag_sample:
+            diag_pre_collision_velocity = vel.copy()
+            diag_clock = time.perf_counter()
         drho = compute_density_rate(vel, pair_i, pair_j, gradW, sph_cfg.mass)
+        if diag_sample:
+            diag_timings["fluid_continuity"] = time.perf_counter() - diag_clock
+            diag_fluid_density_rate = drho.copy()
+            diag_clock = time.perf_counter()
         if settings.enable_wall_continuity and len(boundary.positions):
             add_static_wall_density_rate(
                 drho, vel, boundary, wall_interactions, wall_rho_ref,
                 wall_velocity=wall_velocity,
             )
+        if diag_sample:
+            diag_timings["wall_continuity"] = time.perf_counter() - diag_clock
         rho += drho * dt
         pos += vel * dt
+        if diag_sample:
+            diag_pre_collision_position = pos.copy()
         perf["sph_forces"] += time.perf_counter() - _tp
 
         _tp = time.perf_counter()
@@ -988,7 +1041,24 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
             angular_impulses = {}
             linear_impulses = {}
         total_contacts += contacts
-        perf["collision"] += time.perf_counter() - _tp
+        collision_elapsed = time.perf_counter() - _tp
+        perf["collision"] += collision_elapsed
+        if diag_sample:
+            diag_timings["collision"] = collision_elapsed
+            diagnostics.record(
+                time=t, dt=dt, step=step + 1, ids=particle_ids, before=diag_before,
+                after={"position": pos, "velocity": vel, "rho": rho,
+                       "collision_position_delta": pos - diag_pre_collision_position},
+                acceleration={"fluid_pressure": diag_fluid_pressure,
+                              "wall_pressure": acc_q - diag_fluid_pressure,
+                              "reference_base": acc_base, "viscosity": acc_visc,
+                              "free_surface": fs_state["acc"], "fluid_grain": fluid_grain_acc,
+                              "hook": np.broadcast_to(hook_acceleration, pos.shape), "total": acc},
+                delta_velocity={"air_drag": diag_pre_collision_velocity - (diag_before["velocity"] + acc * dt),
+                                "collision": vel - diag_pre_collision_velocity},
+                density_rate={"fluid": diag_fluid_density_rate, "wall": drho - diag_fluid_density_rate},
+                masks={"shell": fs_state["shell"], "band": fs_state["band"], "detached": detached},
+                triangles=solid_triangles, triangle_paths=solid_triangle_paths, timings=diag_timings)
 
         grain_pair_contacts = 0
         grain_wall_contacts = 0
