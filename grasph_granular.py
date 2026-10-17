@@ -11,6 +11,7 @@ from pathlib import Path
 import time
 
 import numpy as np
+from grasph_joints import JointSystem
 
 from grasph_collision import build_colliders, resolve_collisions
 from grasph_output import save_npz, write_usd_animation, write_usd_checkpoint
@@ -269,6 +270,7 @@ def run_granular_simulation(usd_file, scene, settings, gravity=(0.0, 0.0, -9.81)
         for path in scene.dynamic_bodies
     }
     body_paths = list(scene.dynamic_bodies)
+    joints = JointSystem(scene, body_states, out_dir / (stem + '.joints.jsonl'))
     collider_centers = dict(hinge_centers)
     collider_centers.update({
         path: body.center for path, body in scene.dynamic_bodies.items()
@@ -528,6 +530,7 @@ def run_granular_simulation(usd_file, scene, settings, gravity=(0.0, 0.0, -9.81)
             iterations=settings.collision_iterations,
         ) if body_states and colliders else (0, {})
         total_wall_contacts += body_contacts
+        joints.solve(dt, float(t + dt))
 
         for path, state in body_states.items():
             constrain_body_state(scene.dynamic_bodies[path], state)
@@ -535,6 +538,8 @@ def run_granular_simulation(usd_file, scene, settings, gravity=(0.0, 0.0, -9.81)
             state["rotation"] = _advance_rotation(
                 state["rotation"], state["omega"], dt
             )
+
+        joints.project_poses()
 
         for path, state in hinge_states.items():
             hinge = scene.hinges[path]

@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import time
 import numpy as np
+from grasph_joints import JointSystem
 
 from grasph_scene import load_scene, generate_fluid_particles, generate_granular_particles
 from grasph_sph import (
@@ -348,6 +349,8 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
     configure_neighbor_search(settings.neighbor_backend, settings.neighbor_workers)
 
     scene = load_scene(usd_file)
+    if settings.restart_npz and scene.fixed_joints:
+        raise RuntimeError('Joint state cannot resume from a fluid-only cache; run from the authored start pose.')
     if settings.restart_npz and scene.granular_sources:
         raise RuntimeError(
             "This first restart version is fluid-only. Remove granular sources from "
@@ -513,6 +516,7 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
         for path in scene.dynamic_bodies
     } if settings.enable_solid_coupling else {}
     body_paths = list(body_states)
+    joints = JointSystem(scene, body_states, out_dir / (stem + '.joints.jsonl'))
     collider_centers = dict(hinge_centers)
     collider_centers.update({
         path: body.center for path, body in scene.dynamic_bodies.items()
@@ -1136,6 +1140,7 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
             iterations=settings.collision_iterations,
         ) if body_states and colliders else (0, {})
         total_contacts += body_contacts
+        joints.solve(dt, float(t + dt))
         for path, impulse in body_hinge_reactions.items():
             if path not in hinge_states:
                 continue
@@ -1145,6 +1150,8 @@ def run_simulation(usd_file, sph_cfg=None, settings=None, hooks=None):
             constrain_body_state(scene.dynamic_bodies[path], state)
             state["translation"] += state["velocity"] * dt
             state["rotation"] = advance_rotation(state["rotation"], state["omega"], dt)
+
+        joints.project_poses()
 
         if scene.sinks:
             keep = _sink_keep_mask(pos, scene.sinks)

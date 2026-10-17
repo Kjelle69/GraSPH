@@ -3,7 +3,7 @@
 import bpy
 
 
-DISPLAY_VERSION = "0.1.0"
+DISPLAY_VERSION = "0.2.0"
 
 
 def granular_material():
@@ -27,13 +27,7 @@ def _build_group(radius):
     interface = group.interface
     interface.new_socket(name="Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
     interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
-    radius_socket = interface.new_socket(
-        name="Grain Radius", in_out="INPUT", socket_type="NodeSocketFloat"
-    )
-    radius_socket.default_value = float(radius)
-    radius_socket.min_value = 1.0e-6
-    radius_socket.description = "Rendered radius of each granular particle"
-    group["grasph_sockets"] = {"Grain Radius": radius_socket.identifier}
+    group["grasph_sockets"] = {}
 
     nodes, links = group.nodes, group.links
     entry = nodes.new("NodeGroupInput")
@@ -49,7 +43,11 @@ def _build_group(radius):
     output = nodes.new("NodeGroupOutput")
     output.location = (470, 100)
     links.new(entry.outputs["Geometry"], instances.inputs["Points"])
-    links.new(entry.outputs["Grain Radius"], sphere.inputs["Radius"])
+    # USD widths import as point radii. Read the field on the instanced points,
+    # not on the sphere primitive, to preserve animated, per-particle sizes.
+    point_radius = nodes.new("GeometryNodeInputRadius")
+    sphere.inputs["Radius"].default_value = 1.0
+    links.new(point_radius.outputs["Radius"], instances.inputs["Scale"])
     links.new(sphere.outputs["Mesh"], instances.inputs["Instance"])
     links.new(instances.outputs["Instances"], set_material.inputs["Geometry"])
     links.new(set_material.outputs["Geometry"], output.inputs["Geometry"])
@@ -65,8 +63,6 @@ def add_granular_display(point_cloud, radius):
         point_cloud.modifiers.remove(old)
     modifier = point_cloud.modifiers.new("GraSPH Granular Display", "NODES")
     modifier.node_group = _build_group(radius)
-    identifier = modifier.node_group["grasph_sockets"]["Grain Radius"]
-    modifier[identifier] = float(radius)
     point_cloud["grasph:displayKind"] = "granular"
     if old_group and old_group.users == 0:
         bpy.data.node_groups.remove(old_group)

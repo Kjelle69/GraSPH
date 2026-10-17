@@ -1,5 +1,67 @@
 # GraSPH
 
+## Shared physics material library
+
+The **GraSPH Physics Materials** panel has editable shared materials and **Assign
+to Selected** for colliders, Dynamic Bodies, Dynamic Hinges and Granular Sources.
+Use **Load Example Materials** to populate Sand, Gravel, Grain, Rubber and Steel;
+these are illustrative defaults, not calibrated physical measurements. Add a
+preset and rename it to create your own material. Materials are saved in the
+blend file, with fake users so unused library entries are retained.
+
+Each supported entity has a **Physics Material** ID selector. Select an existing
+entry or drag a physics material datablock from Outliner (Blender File mode,
+Materials) into this field. This is a dedicated physics-reference drop target,
+NOT viewport shader drag/drop. The library's Assign button also handles multiple
+selected entities. Shader slots are never changed by these operations.
+
+Linked entities share friction, restitution and rolling resistance. Granular
+sources additionally use material density. Rigid mass/inertia remain explicit;
+material density does not recalculate them. Unlinking restores the object's
+manual parameters. Editing a shared material affects all linked entities on the
+next export, not an already-running solver. Fluid parameters and joint break
+thresholds remain separate. Export resolves the shared values into solver USD
+metadata and shares native USD Physics material bindings for linked colliders.
+
+## Shared fixed joints (experimental)
+
+Reload development controls only when no simulation is running. Keep both
+meshes as **Dynamic Body**. Select them (active body becomes Body B), choose
+**Fixed** in Add Joint Anchor and add a separate Empty at the 3D cursor. Its
+**Joint** panel has **Body A**, **Body B** and **Breakable**. Empty Body A means
+world. Breakable off means infinite strength; on exposes force (N) and torque
+(Nm) thresholds. Either limit can break the joint. Bodies may participate in
+multiple fixed joints; topology is explicit, with no hidden root/star grouping.
+
+For batch authoring, select two or more Dynamic Bodies, making the intended hub
+active last. In **Project & Scene > Joint Placement**, choose Fixed, set the
+new-joint Breakable/force/torque values, then **Connect Selected to Active**.
+It creates N-1 ordinary Joint empties in a scene-local **GraSPH Joints**
+collection, anchored halfway between each pair's configured body centers.
+Existing Fixed pairs are skipped in either endpoint order and are not modified.
+Non-body selections are ignored; selection and active body are preserved.
+The same new-joint break settings also apply to the single Add Joint action.
+This is an authoring shortcut, not a different solver or all-pairs connection.
+
+Leave clearance for collision margins, then export and run normally. Start with
+rigid-only tests; fluid runs require Fluid / Solid Coupling. Legacy world-only
+hinges/sliders retain their original behavior; two-body and breakable support
+currently applies only to Fixed. Unsupported combinations are validation errors.
+
+The demo-scene button and Fracture Group system have been removed. Existing
+Blender scenes are not deleted: restore any mesh accidentally tagged as Joint
+to Dynamic Body, add separate Joint empties, and re-export. Old USD files with
+Fracture Group are rejected rather than silently simulated with a different
+meaning. Voronoi will be an authoring tool that creates ordinary bodies and
+these same joints, not a separate physics system.
+
+Fixed constraints are solved together using reaction impulses; closed loops use
+a minimum-norm solution. Intact connected bodies suppress internal collisions.
+External contacts are still per-body and pose stabilization can affect energy.
+Impact break thresholds depend on timestep; this is not a material stress model.
+Events are saved in `<result>.joints.jsonl`, motion in USD. Fluid-only restart
+cannot restore joint state. No new distribution has been built for this change.
+
 GraSPH simulates SPH fluids, granular particles and rigid bodies from OpenUSD
 scenes. Blender controls handle scene roles, export, simulation and result
 display. The numerical solver runs in an external Python process.

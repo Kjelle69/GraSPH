@@ -1,5 +1,54 @@
 # Development plan
 
+## Shared physics materials (2026-10-17)
+
+Implemented in development controls: a filtered physics material library using
+Blender Material IDs as storage, separate from shader slot assignment. Entity
+references resolve shared parameters at export; manual settings remain the
+fallback when unlinked. Supports colliders, rigid bodies/hinges and granular
+sources. Grain density is included; rigid mass/inertia are not auto-derived.
+Native ID selectors accept material reference drops from Outliner; direct
+viewport shader dropping is deliberately not repurposed as physics assignment.
+The panel also supports multi-selected entity assignment and editable example
+presets. Shared data/reference persistence, reload and USD export are covered by
+`tests/blender_physics_materials_smoke.py`.
+
+Future: dedicated asset/viewport drag interaction if desired, calibrated material
+libraries, optional geometry-derived rigid mass/inertia and separate joint
+strength profiles. No claim of per-material fluid viscosity/density support.
+
+## Shared joints and future fracture authoring
+
+Batch authoring: Connect Selected to Active now creates one ordinary Fixed
+Joint per selected Dynamic Body to the active body, using common new-joint
+break settings. Midpoint anchors, scene-local Joint collection, duplicate-pair
+prevention and unchanged selection are covered by Blender smoke tests. No
+special group state or new physics path is introduced.
+
+Decision 2026-10-17: no separate fracture physics system. The experimental
+Fracture Group/star coupling and demo-scene operator have been removed.
+`grasph_joints.py` solves explicit Fixed joints between two Dynamic Bodies or
+a body and world. Blender Joint empties expose Body A (optional world), Body B,
+Breakable and force/torque limits. Breakable off is infinite strength. Old
+world-only hinges/sliders retain their original, non-breakable behavior.
+
+Constraints use a simultaneous bilateral impulse solve with world-space inverse
+inertia, per-joint reaction loads, irreversible breaks and connected-component
+collision filtering/pose stabilization. Loops use a minimum-norm solution.
+Events use .joints.jsonl; existing USD motion output is reused. Legacy fracture
+USD is rejected with migration guidance. Plain scenes retain their original
+path. No distribution has been built.
+
+Limitations: per-body external contacts rather than compound manifolds;
+stabilization can change energy; impact force limits depend on timestep;
+loop reactions are not unique material stresses; no full-state joint restart.
+Two-body/breakable hinges and sliders need constraint-specific solvers.
+
+Next: timestep/energy tests and larger graphs, then Voronoi authoring that
+generates convex bodies and explicit neighbor joints. Never introduce a
+parallel fracture integrator. Preserve original meshes/scenes during generation.
+Coupled-fluid joint validation remains pending.
+
 ## Fluid / rigid-body baseline freeze (2026-10-16)
 
 User decision: freeze the current fluid and rigid-body implementation as the

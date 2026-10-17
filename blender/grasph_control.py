@@ -33,10 +33,11 @@ from bpy.props import (
     EnumProperty,
     FloatProperty,
     FloatVectorProperty,
+    IntProperty,
     PointerProperty,
     StringProperty,
 )
-from bpy.types import Operator, Panel, PropertyGroup
+from bpy.types import Operator, Panel, PropertyGroup, UIList
 
 
 ROLE_ITEMS = (
@@ -48,7 +49,7 @@ ROLE_ITEMS = (
     ("KINEMATIC", "Kinematic Collider", "Animated collider that drives the fluid"),
     ("DYNAMIC_HINGE", "Dynamic Hinge", "Collider driven by fluid torque around one axle"),
     ("DYNAMIC_BODY", "Dynamic Body", "Freely translating and rotating rigid collider"),
-    ("JOINT", "Joint Anchor", "Visible joint frame linked to a Dynamic Body"),
+    ("JOINT", "Joint", "Separate constraint between two bodies or a body and the world"),
     ("IGNORE", "Visual Only", "Export visually but exclude from simulation"),
 )
 
@@ -68,7 +69,7 @@ JOINT_TYPE_ITEMS = (
     ("REVOLUTE", "Revolute / Hinge", "One rotational degree of freedom"),
     ("PRISMATIC", "Prismatic / Linear", "One translational degree of freedom"),
     ("FREE", "Free", "No joint constraint; body remains fully dynamic"),
-    ("FIXED", "Fixed", "Lock this body to the world"),
+    ("FIXED", "Fixed", "Weld Body A and Body B; empty Body A means world"),
 )
 
 QUALITY_PRESETS = {
@@ -89,6 +90,39 @@ _RUNNING = None
 _RESET_REQUESTED = False
 _ENV_JOB = None
 _ENVIRONMENT_MODULE = None
+
+
+def _physics_values(settings):
+    """Resolve shared physical parameters only; never replace shader slots."""
+    material = settings.physics_material
+    if material is not None:
+        p = material.grasph_physics
+        if not p.enabled:
+            raise ValueError(f'{material.name}: not a GraSPH physics material')
+        values = dict(density=p.density, friction=p.friction,
+                      restitution=p.restitution, rolling=p.rolling_friction)
+    elif settings.role == 'GRANULAR_SOURCE':
+        values = dict(density=settings.granular_density, friction=settings.granular_friction,
+                      restitution=settings.granular_restitution, rolling=settings.granular_rolling_friction)
+    else:
+        values = dict(density=0., friction=settings.collider_friction,
+                      restitution=settings.collider_restitution, rolling=settings.collider_rolling_friction)
+    if not all(math.isfinite(v) for v in values.values()):
+        raise ValueError('Physics material values must be finite')
+    if values['friction'] < 0 or values['rolling'] < 0 or not 0 <= values['restitution'] <= 1:
+        raise ValueError('Invalid physics friction/restitution')
+    if settings.role == 'GRANULAR_SOURCE' and values['density'] <= 0:
+        raise ValueError('Grain density must be positive')
+    return values
+
+
+def _new_physics_material(preset='SAND'):
+    material = bpy.data.materials.new('GraSPH Physics - '+preset.title())
+    material.use_fake_user = True
+    p = material.grasph_physics
+    p.enabled = True
+    p.density, p.friction, p.restitution, p.rolling_friction = GRANULAR_MATERIAL_PRESETS[preset]
+    return material
 
 
 def _tail_solver_log(log_file):
@@ -231,7 +265,14 @@ def _add_live_particle_display(obj, kind, radius):
     instances = nodes.new("GeometryNodeInstanceOnPoints")
     output = nodes.new("NodeGroupOutput")
     links.new(entry.outputs["Geometry"], instances.inputs["Points"])
-    links.new(entry.outputs["Radius"], sphere.inputs["Radius"])
+    if kind == "granular":
+        radii = nodes.new("GeometryNodeInputNamedAttribute")
+        radii.data_type = "FLOAT"
+        radii.inputs["Name"].default_value = "grasph_radius"
+        sphere.inputs["Radius"].default_value = 1.0
+        links.new(radii.outputs["Attribute"], instances.inputs["Scale"])
+    else:
+        links.new(entry.outputs["Radius"], sphere.inputs["Radius"])
     links.new(sphere.outputs["Mesh"], instances.inputs["Instance"])
     links.new(instances.outputs["Instances"], output.inputs["Geometry"])
     modifier = obj.modifiers.new(f"GraSPH Live {kind.title()} Display", "NODES")
@@ -275,6 +316,10 @@ def _update_live_preview(scene, path):
             fluid_velocity = preview["velocity"].copy()
             grains = preview["granular_positions"].copy()
             grain_velocity = preview["granular_velocity"].copy()
+            grain_radii = preview["granular_radii"].copy()
+            if (grain_radii.shape != (len(grains),) or
+                    not np.all(np.isfinite(grain_radii)) or np.any(grain_radii <= 0)):
+                return None
             time_value = float(preview["time"])
             progress = float(preview["progress"])
             body_paths = preview["body_paths"].astype(str).tolist()
@@ -303,9 +348,15 @@ def _update_live_preview(scene, path):
             cloud.data = updated_data
             if old_data.users == 0:
                 bpy.data.meshes.remove(old_data)
+        if kind == "granular":
+            attribute = cloud.data.attributes.get("grasph_radius")
+            if attribute is None:
+                attribute = cloud.data.attributes.new("grasph_radius", "FLOAT", "POINT")
+            attribute.data.foreach_set("value", grain_radii.astype("f", copy=False))
+            cloud.data.update()
         if cloud.get("grasph:live_display_ready") != kind and len(coordinates):
             try:
-                radius = (float(scene.grasph_scene.live_grain_radius)
+                radius = (1.0
                           if kind == "granular" else
                           max(float(scene.grasph_scene.dp) * 0.18, 1.0e-5))
                 _add_live_particle_display(cloud, kind, radius)
@@ -765,12 +816,28 @@ def validate_scene(scene):
 
     for obj in tagged:
         settings = obj.grasph
+        physical = None
+        if settings.role in _COLLIDER_ROLES | {'GRANULAR_SOURCE'}:
+            try:
+                physical = _physics_values(settings)
+            except ValueError as error:
+                errors.append(f'{obj.name}: {error}')
+                continue
         if settings.role == "JOINT":
             if obj.type != "EMPTY":
                 errors.append(f"{obj.name}: Joint Anchor must be an Empty.")
             body = settings.joint_body1
             if body is None or body.grasph.role != "DYNAMIC_BODY":
-                errors.append(f"{obj.name}: assign one Dynamic Body to this joint.")
+                errors.append(f"{obj.name}: assign a Dynamic Body as Body B.")
+            other = settings.joint_body0
+            if other is not None and (other == body or other.grasph.role != 'DYNAMIC_BODY' or other not in tagged):
+                errors.append(f'{obj.name}: Body A must be another Dynamic Body in this scene.')
+            if body is not None and body not in tagged:
+                errors.append(f'{obj.name}: Body B must belong to this scene.')
+            if settings.joint_type != 'FIXED' and (other is not None or settings.joint_breakable):
+                errors.append(f'{obj.name}: two-body/breakable joints currently require Fixed type.')
+            if settings.joint_type == 'FIXED' and fluid_objects and not scene.grasph_scene.enable_solid_coupling:
+                errors.append(f'{obj.name}: enable Fluid / Solid Coupling to simulate joints with fluid.')
             continue
         if obj.type != "MESH":
             errors.append(f"{obj.name}: role {settings.role} requires a mesh object.")
@@ -789,11 +856,11 @@ def validate_scene(scene):
         if settings.role == "GRANULAR_SOURCE":
             if settings.granular_radius <= 0.0:
                 errors.append(f"{obj.name}: granular radius must be positive.")
-            if settings.granular_density <= 0.0:
+            if physical['density'] <= 0.0:
                 errors.append(f"{obj.name}: granular density must be positive.")
-            if settings.granular_restitution > 0.5:
+            if physical['restitution'] > 0.5:
                 warnings.append(
-                    f"{obj.name}: restitution {settings.granular_restitution:g} "
+                    f"{obj.name}: restitution {physical['restitution']:g} "
                     "is highly energetic in a dense granular volume."
                 )
             if settings.granular_source_mode == "FLOW":
@@ -806,6 +873,8 @@ def validate_scene(scene):
 
     constrained_bodies = {}
     for joint_obj in (obj for obj in tagged if obj.grasph.role == "JOINT"):
+        if joint_obj.grasph.joint_type == 'FIXED':
+            continue
         body = joint_obj.grasph.joint_body1
         if body is None:
             continue
@@ -858,18 +927,23 @@ def _author_usd_physics(stage, objects, scene):
         settings = obj.grasph
         if settings.role not in {"STATIC", "KINEMATIC", "DYNAMIC_HINGE", "DYNAMIC_BODY"}:
             continue
+        physical = _physics_values(settings)
         owner = _matching_xform(stage, obj.name)
         if owner is None:
             continue
         meshes = [prim for prim in Usd.PrimRange(owner) if prim.IsA(UsdGeom.Mesh)]
-        material_name = Tf.MakeValidIdentifier(obj.name + "_PhysicsMaterial")
+        material_name = Tf.MakeValidIdentifier(
+            (settings.physics_material.name if settings.physics_material else obj.name) + "_PhysicsMaterial")
+        if settings.physics_material:
+            import hashlib
+            material_name += '_' + hashlib.sha256(settings.physics_material.name.encode('utf-8')).hexdigest()[:12]
         material = UsdShade.Material.Define(
             stage, materials_root.GetPath().AppendChild(material_name)
         )
         material_api = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
-        material_api.CreateStaticFrictionAttr(float(settings.collider_friction))
-        material_api.CreateDynamicFrictionAttr(float(settings.collider_friction))
-        material_api.CreateRestitutionAttr(float(settings.collider_restitution))
+        material_api.CreateStaticFrictionAttr(float(physical['friction']))
+        material_api.CreateDynamicFrictionAttr(float(physical['friction']))
+        material_api.CreateRestitutionAttr(float(physical['restitution']))
         for mesh in meshes:
             UsdPhysics.CollisionAPI.Apply(mesh).CreateCollisionEnabledAttr(True)
             mesh_api = UsdPhysics.MeshCollisionAPI.Apply(mesh)
@@ -940,6 +1014,27 @@ def _author_usd_physics(stage, objects, scene):
                 f"Joint {obj.name!r} cannot find its body {body.name!r} in exported USD"
             )
         kind = settings.joint_type
+        if kind == 'FIXED':
+            other = settings.joint_body0
+            other_prim = _matching_xform(stage, other.name) if other else None
+            joint = UsdPhysics.FixedJoint.Define(stage, joints_root.GetPath().AppendChild(Tf.MakeValidIdentifier(obj.name)))
+            joint.CreateBody1Rel().SetTargets([body_prim.GetPath()])
+            if other:
+                if other_prim is None:
+                    raise RuntimeError(f'Cannot export joint Body A: {other.name}')
+                joint.CreateBody0Rel().SetTargets([other_prim.GetPath()])
+            anchor = obj.matrix_world.translation.copy()
+            frame = obj.matrix_world.to_quaternion()
+            for index, endpoint in ((0, other), (1, body)):
+                position = endpoint.matrix_world.inverted() @ anchor if endpoint else anchor
+                rotation = endpoint.matrix_world.to_quaternion().inverted() @ frame if endpoint else frame
+                getattr(joint, f'CreateLocalPos{index}Attr')(Gf.Vec3f(*map(float, position)))
+                getattr(joint, f'CreateLocalRot{index}Attr')(Gf.Quatf(float(rotation.w), Gf.Vec3f(float(rotation.x), float(rotation.y), float(rotation.z))))
+            joint.CreateBreakForceAttr(settings.joint_break_force if settings.joint_breakable else float('inf'))
+            joint.CreateBreakTorqueAttr(settings.joint_break_torque if settings.joint_breakable else float('inf'))
+            joint.CreateCollisionEnabledAttr(False)
+            joint.GetPrim().CreateAttribute('grasph:managedJoint', Sdf.ValueTypeNames.Bool).Set(True)
+            continue
         anchor = obj.matrix_world.translation.copy()
         axis_local = Vector({
             "X": (1.0, 0.0, 0.0), "Y": (0.0, 1.0, 0.0),
@@ -1036,6 +1131,22 @@ def author_grasph_metadata(usd_path, objects, scene=None):
                 raise RuntimeError(
                     f"Joint {obj.name!r} cannot find its Dynamic Body {body.name!r}"
                 )
+            if settings.joint_type == 'FIXED':
+                owner.CreateAttribute('grasph:jointType', Sdf.ValueTypeNames.String).Set('fixed')
+                owner.CreateRelationship('grasph:bodyB').SetTargets([body_owner.GetPath()])
+                other = settings.joint_body0
+                targets_a = []
+                if other:
+                    other_owner = _matching_xform(stage, other.name)
+                    if other_owner is None:
+                        raise RuntimeError(f'Cannot export joint Body A: {other.name}')
+                    targets_a = [other_owner.GetPath()]
+                owner.CreateRelationship('grasph:bodyA').SetTargets(targets_a)
+                owner.CreateAttribute('grasph:jointAnchor', Sdf.ValueTypeNames.Double3).Set(Gf.Vec3d(*obj.matrix_world.translation))
+                owner.CreateAttribute('grasph:breakable', Sdf.ValueTypeNames.Bool).Set(settings.joint_breakable)
+                owner.CreateAttribute('grasph:breakForce', Sdf.ValueTypeNames.Double).Set(settings.joint_break_force)
+                owner.CreateAttribute('grasph:breakTorque', Sdf.ValueTypeNames.Double).Set(settings.joint_break_torque)
+                continue
             axis_local = Vector({
                 "X": (1.0, 0.0, 0.0), "Y": (0.0, 1.0, 0.0),
                 "Z": (0.0, 0.0, 1.0),
@@ -1062,16 +1173,19 @@ def author_grasph_metadata(usd_path, objects, scene=None):
             continue
 
         if settings.role in {"STATIC", "KINEMATIC", "DYNAMIC_HINGE", "DYNAMIC_BODY"}:
+            physical = _physics_values(settings)
             for prim in targets:
                 prim.CreateAttribute(
                     "grasph:friction", Sdf.ValueTypeNames.Double
-                ).Set(settings.collider_friction)
+                ).Set(physical['friction'])
                 prim.CreateAttribute(
                     "grasph:restitution", Sdf.ValueTypeNames.Double
-                ).Set(settings.collider_restitution)
+                ).Set(physical['restitution'])
                 prim.CreateAttribute(
                     "grasph:rollingFriction", Sdf.ValueTypeNames.Double
-                ).Set(settings.collider_rolling_friction)
+                ).Set(physical['rolling'])
+                if settings.physics_material:
+                    prim.CreateAttribute('grasph:physicsMaterial', Sdf.ValueTypeNames.String).Set(settings.physics_material.name)
 
         if settings.role == "DYNAMIC_HINGE":
             center = _object_center(obj, settings)
@@ -1121,22 +1235,25 @@ def author_grasph_metadata(usd_path, objects, scene=None):
                     "grasph:collisionMargin", Sdf.ValueTypeNames.Double
                 ).Set(settings.body_collision_margin)
         elif settings.role == "GRANULAR_SOURCE":
+            physical = _physics_values(settings)
             for prim in targets:
                 prim.CreateAttribute(
                     "grasph:particleRadius", Sdf.ValueTypeNames.Double
                 ).Set(settings.granular_radius)
                 prim.CreateAttribute(
                     "grasph:density", Sdf.ValueTypeNames.Double
-                ).Set(settings.granular_density)
+                ).Set(physical['density'])
                 prim.CreateAttribute(
                     "grasph:friction", Sdf.ValueTypeNames.Double
-                ).Set(settings.granular_friction)
+                ).Set(physical['friction'])
                 prim.CreateAttribute(
                     "grasph:restitution", Sdf.ValueTypeNames.Double
-                ).Set(settings.granular_restitution)
+                ).Set(physical['restitution'])
                 prim.CreateAttribute(
                     "grasph:rollingFriction", Sdf.ValueTypeNames.Double
-                ).Set(settings.granular_rolling_friction)
+                ).Set(physical['rolling'])
+                if settings.physics_material:
+                    prim.CreateAttribute('grasph:physicsMaterial', Sdf.ValueTypeNames.String).Set(settings.physics_material.name)
                 prim.CreateAttribute(
                     "grasph:sourceMode", Sdf.ValueTypeNames.String
                 ).Set(settings.granular_source_mode.lower())
@@ -1191,7 +1308,18 @@ def export_scene(context, filepath):
     author_grasph_metadata(filepath, tagged, context.scene)
 
 
+class GraSPHPhysicsMaterial(PropertyGroup):
+    enabled: BoolProperty(name='GraSPH Physics Material', default=False)
+    density: FloatProperty(name='Grain Density (kg/m3)', default=1600., min=.001)
+    friction: FloatProperty(name='Friction', default=.45, min=0., max=2.)
+    restitution: FloatProperty(name='Restitution', default=.1, min=0., max=1.)
+    rolling_friction: FloatProperty(name='Rolling Resistance', default=.02, min=0., max=1.)
+
+
 class GraSPHObjectSettings(PropertyGroup):
+    physics_material: PointerProperty(name='Physics Material', type=bpy.types.Material,
+        description='Shared physical properties; drop a GraSPH physics Material ID here, not on shader slots',
+        poll=lambda self, material: material.grasph_physics.enabled)
     role: EnumProperty(name="Entity", items=ROLE_ITEMS, default="NONE")
     axis: EnumProperty(
         name="World Axis",
@@ -1217,7 +1345,7 @@ class GraSPHObjectSettings(PropertyGroup):
         default=40.0, min=0.0,
     )
     joint_type: EnumProperty(
-        name="Joint Type", items=JOINT_TYPE_ITEMS, default="PRISMATIC",
+        name="Joint Type", items=JOINT_TYPE_ITEMS, default="FIXED",
     )
     joint_axis: EnumProperty(
         name="Joint Axis",
@@ -1226,10 +1354,19 @@ class GraSPHObjectSettings(PropertyGroup):
         default="Z",
     )
     joint_body1: PointerProperty(
-        name="Dynamic Body", type=bpy.types.Object,
-        description="Rigid body connected to this world-anchored joint",
+        name="Body B", type=bpy.types.Object,
+        description="Dynamic body constrained by this joint",
         poll=lambda self, obj: obj.grasph.role == "DYNAMIC_BODY",
     )
+    joint_body0: PointerProperty(
+        name='Body A', type=bpy.types.Object,
+        description='Other Dynamic Body; leave empty to attach Body B to the world',
+        poll=lambda self, obj: obj.grasph.role == 'DYNAMIC_BODY',
+    )
+    joint_breakable: BoolProperty(name='Breakable', default=False,
+        description='Off means infinite strength; currently supported for Fixed joints')
+    joint_break_force: FloatProperty(name='Break Force (N)', default=500., min=.001)
+    joint_break_torque: FloatProperty(name='Break Torque (Nm)', default=50., min=.001)
     collider_friction: FloatProperty(
         name="Surface Friction", description="Collider Coulomb friction coefficient",
         default=0.45, min=0.0, max=2.0,
@@ -1322,6 +1459,10 @@ class GraSPHObjectSettings(PropertyGroup):
 
 
 class GraSPHSceneSettings(PropertyGroup):
+    physics_material_index: IntProperty(default=0, min=0)
+    physics_material_preset: EnumProperty(name='Example Preset',
+        items=tuple((key, key.title(), 'Illustrative simulation values, not calibrated material data')
+                    for key in GRANULAR_MATERIAL_PRESETS), default='SAND')
     project_root: StringProperty(name="GraSPH Project", subtype="DIR_PATH", default=_default_project_root())
     usd_file: StringProperty(name="Scene USDC", subtype="FILE_PATH", default="//grasph_scene.usdc")
     python_command: StringProperty(
@@ -1364,8 +1505,12 @@ class GraSPHSceneSettings(PropertyGroup):
     output_dir: StringProperty(name="Output Folder", subtype="DIR_PATH", default="//output")
     output_name: StringProperty(name="Result Name", default="grasph_result")
     new_joint_type: EnumProperty(
-        name="Joint Type", items=JOINT_TYPE_ITEMS, default="PRISMATIC",
+        name="Joint Type", items=JOINT_TYPE_ITEMS, default="FIXED",
     )
+    new_joint_breakable: BoolProperty(name='Breakable', default=False,
+        description='Shared settings for newly created Fixed joints; off means infinite strength')
+    new_joint_break_force: FloatProperty(name='Break Force (N)', default=500., min=.001)
+    new_joint_break_torque: FloatProperty(name='Break Torque (Nm)', default=50., min=.001)
     live_preview: BoolProperty(
         name="Live Viewport Preview", default=True,
         description="Stream fluid/grain snapshots into Blender while the external solver runs",
@@ -1556,6 +1701,7 @@ class GRASPH_OT_add_joint_anchor(Operator):
         body = context.active_object
         if body is not None and body.grasph.role != "DYNAMIC_BODY":
             body = None
+        others = [obj for obj in context.selected_objects if obj != body and obj.grasph.role == 'DYNAMIC_BODY']
         bpy.ops.object.empty_add(
             type="ARROWS", align="WORLD", location=context.scene.cursor.location
         )
@@ -1567,11 +1713,83 @@ class GRASPH_OT_add_joint_anchor(Operator):
         anchor.grasph.role = "JOINT"
         anchor.grasph.joint_type = context.scene.grasph_scene.new_joint_type
         anchor.grasph.joint_body1 = body
+        if len(others) == 1 and anchor.grasph.joint_type == 'FIXED':
+            anchor.grasph.joint_body0 = others[0]
+        if anchor.grasph.joint_type == 'FIXED':
+            source = context.scene.grasph_scene
+            anchor.grasph.joint_breakable = source.new_joint_breakable
+            anchor.grasph.joint_break_force = source.new_joint_break_force
+            anchor.grasph.joint_break_torque = source.new_joint_break_torque
         self.report(
             {"INFO"},
             "Joint anchor added at the 3D Cursor; move/rotate it to place the joint",
         )
         return {"FINISHED"}
+
+
+class GRASPH_OT_connect_selected(Operator):
+    bl_idname = 'grasph.connect_selected'
+    bl_label = 'Connect Selected to Active'
+    bl_description = 'Create one Fixed Joint from each selected Dynamic Body to the active body; existing pairs are skipped'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        active = context.active_object
+        if context.mode != 'OBJECT' or active is None or active.type != 'MESH':
+            return False
+        if active.grasph.role != 'DYNAMIC_BODY' or active not in context.selected_objects:
+            return False
+        if context.scene.grasph_scene.new_joint_type != 'FIXED':
+            return False
+        if _RUNNING is not None and _RUNNING.poll() is None:
+            return False
+        return sum(obj.type == 'MESH' and obj.grasph.role == 'DYNAMIC_BODY'
+                   for obj in context.selected_objects) >= 2
+
+    def execute(self, context):
+        if not self.poll(context):
+            self.report({'ERROR'}, 'Select at least two Dynamic Bodies, make one active and choose Fixed')
+            return {'CANCELLED'}
+        from mathutils import Vector
+        active = context.active_object
+        targets = sorted((obj for obj in context.selected_objects if obj != active
+                          and obj.type == 'MESH' and obj.grasph.role == 'DYNAMIC_BODY'),
+                         key=lambda obj: obj.name)
+        existing = {
+            frozenset((obj.grasph.joint_body0, obj.grasph.joint_body1))
+            for obj in context.scene.objects
+            if obj.grasph.role == 'JOINT' and obj.grasph.joint_type == 'FIXED'
+            and obj.grasph.joint_body0 and obj.grasph.joint_body1
+        }
+        missing = [obj for obj in targets if frozenset((obj, active)) not in existing]
+        if not missing:
+            self.report({'INFO'}, 'All selected body pairs already have Fixed joints; nothing changed')
+            return {'FINISHED'}
+        collection = next((c for c in context.scene.collection.children
+                           if c.get('grasph:jointCollection')), None)
+        if collection is None:
+            collection = bpy.data.collections.new('GraSPH Joints')
+            collection['grasph:jointCollection'] = True
+            context.scene.collection.children.link(collection)
+        source = context.scene.grasph_scene
+        active_center = Vector(_object_center(active, active.grasph))
+        for obj in missing:
+            anchor = bpy.data.objects.new(f'GraSPH_Joint_{obj.name}_to_{active.name}', None)
+            collection.objects.link(anchor)
+            anchor.empty_display_type = 'ARROWS'
+            anchor.empty_display_size = .25
+            anchor.show_in_front = True
+            anchor.location = .5*(active_center+Vector(_object_center(obj, obj.grasph)))
+            anchor.grasph.role = 'JOINT'
+            anchor.grasph.joint_type = 'FIXED'
+            anchor.grasph.joint_body0 = obj
+            anchor.grasph.joint_body1 = active
+            anchor.grasph.joint_breakable = source.new_joint_breakable
+            anchor.grasph.joint_break_force = source.new_joint_break_force
+            anchor.grasph.joint_break_torque = source.new_joint_break_torque
+        self.report({'INFO'}, f'Created {len(missing)} Fixed joints to {active.name}; skipped {len(targets)-len(missing)} existing pairs')
+        return {'FINISHED'}
 
 
 class GRASPH_OT_granular_material_preset(Operator):
@@ -1590,6 +1808,7 @@ class GRASPH_OT_granular_material_preset(Operator):
         density, friction, restitution, rolling = GRANULAR_MATERIAL_PRESETS[preset]
         for obj in targets:
             obj.grasph.granular_material_preset = preset
+            obj.grasph.physics_material = None
             obj.grasph.granular_density = density
             obj.grasph.granular_friction = friction
             obj.grasph.granular_restitution = restitution
@@ -2142,6 +2361,78 @@ class GRASPH_OT_refresh_granular_display(Operator):
         return {"FINISHED"}
 
 
+class GRASPH_UL_physics_materials(UIList):
+    def filter_items(self, context, data, propname):
+        return ([self.bitflag_filter_item if m.grasph_physics.enabled else 0
+                 for m in getattr(data, propname)], [])
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        layout.prop(item, 'name', text='', emboss=False, icon='MATERIAL')
+
+
+class GRASPH_OT_physics_material(Operator):
+    bl_idname = 'grasph.physics_material'
+    bl_label = 'Physics Material'
+    bl_options = {'REGISTER', 'UNDO'}
+    action: EnumProperty(items=(('ADD', 'Add', ''), ('EXAMPLES', 'Examples', ''),
+                               ('ASSIGN', 'Assign to Selected', '')))
+
+    def execute(self, context):
+        settings = context.scene.grasph_scene
+        if self.action in {'ADD', 'EXAMPLES'}:
+            keys = GRANULAR_MATERIAL_PRESETS if self.action == 'EXAMPLES' else [settings.physics_material_preset]
+            material = None
+            for key in keys:
+                existing = bpy.data.materials.get('GraSPH Physics - '+key.title())
+                if self.action == 'EXAMPLES' and existing and existing.grasph_physics.enabled:
+                    material = existing
+                else:
+                    material = _new_physics_material(key)
+            settings.physics_material_index = list(bpy.data.materials).index(material)
+            return {'FINISHED'}
+        index = settings.physics_material_index
+        if index >= len(bpy.data.materials) or not bpy.data.materials[index].grasph_physics.enabled:
+            self.report({'ERROR'}, 'Choose a physics material from the list')
+            return {'CANCELLED'}
+        material = bpy.data.materials[index]
+        targets = [obj for obj in context.selected_objects
+                   if obj.grasph.role in _COLLIDER_ROLES | {'GRANULAR_SOURCE'}]
+        if not targets:
+            self.report({'ERROR'}, 'Select colliders, Dynamic Bodies or Granular Sources')
+            return {'CANCELLED'}
+        for obj in targets:
+            obj.grasph.physics_material = material
+        self.report({'INFO'}, f'Assigned {material.name} to {len(targets)} entities (visual materials unchanged)')
+        return {'FINISHED'}
+
+
+class GRASPH_PT_physics_materials(Panel):
+    bl_label = 'GraSPH Physics Materials'
+    bl_idname = 'GRASPH_PT_physics_materials'
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'GraSPH'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.grasph_scene
+        row = layout.row(align=True)
+        row.prop(settings, 'physics_material_preset', text='')
+        row.operator('grasph.physics_material', text='Add').action = 'ADD'
+        layout.operator('grasph.physics_material', text='Load Example Materials').action = 'EXAMPLES'
+        layout.template_list('GRASPH_UL_physics_materials', '', bpy.data, 'materials', settings, 'physics_material_index', rows=5)
+        layout.operator('grasph.physics_material', text='Assign to Selected').action = 'ASSIGN'
+        index = settings.physics_material_index
+        if index < len(bpy.data.materials):
+            material = bpy.data.materials[index]
+            if material.grasph_physics.enabled:
+                layout.label(text='Shared properties — affects all linked entities', icon='LINKED')
+                for name in ('density', 'friction', 'restitution', 'rolling_friction'):
+                    layout.prop(material.grasph_physics, name)
+        layout.label(text='Example values, not calibrated material data', icon='INFO')
+
+
 class GRASPH_PT_entities(Panel):
     bl_label = "GraSPH Entities"
     bl_idname = "GRASPH_PT_entities"
@@ -2162,11 +2453,34 @@ class GRASPH_PT_entities(Panel):
         layout.label(text=obj.name, icon="OBJECT_DATA")
         layout.prop(settings, "role")
         layout.operator("grasph.assign_selected")
+        if settings.role in _COLLIDER_ROLES | {'GRANULAR_SOURCE'}:
+            material_box = layout.box()
+            material_box.label(text='Physics Material (not shader)', icon='PHYSICS')
+            material_box.template_ID(settings, 'physics_material')
+            if settings.physics_material:
+                material_box.label(text='Shared: edits affect all users', icon='LINKED')
+                p = settings.physics_material.grasph_physics
+                if settings.role == 'GRANULAR_SOURCE':
+                    material_box.prop(p, 'density')
+                for field in ('friction', 'restitution', 'rolling_friction'):
+                    material_box.prop(p, field)
+                if settings.role == 'DYNAMIC_BODY':
+                    material_box.label(text='Mass / inertia remain explicit')
         if settings.role == "JOINT":
             box = layout.box()
-            box.label(text="World-Anchored Joint")
+            box.label(text="Joint")
             box.prop(settings, "joint_type")
+            if settings.joint_type == 'FIXED':
+                box.prop(settings, 'joint_body0')
             box.prop(settings, "joint_body1")
+            if settings.joint_type == 'FIXED':
+                box.label(text='Empty Body A = World', icon='INFO')
+                box.prop(settings, 'joint_breakable')
+                if settings.joint_breakable:
+                    box.prop(settings, 'joint_break_force')
+                    box.prop(settings, 'joint_break_torque')
+                else:
+                    box.label(text='Unbreakable (infinite strength)')
             if settings.joint_type in {"REVOLUTE", "PRISMATIC"}:
                 box.prop(settings, "joint_axis", expand=True)
             box.label(text="Move/rotate this Empty to place its anchor", icon="ORIENTATION_GIMBAL")
@@ -2205,13 +2519,15 @@ class GRASPH_PT_entities(Panel):
             box.label(text="Granular Physics")
             box.prop(settings, "granular_source_mode")
             box.prop(settings, "granular_radius")
-            preset_row = box.row(align=True)
+            manual = box.column()
+            manual.enabled = settings.physics_material is None
+            preset_row = manual.row(align=True)
             preset_row.prop(settings, "granular_material_preset", text="Material")
             preset_row.operator("grasph.granular_material_preset", text="Apply")
-            box.prop(settings, "granular_density")
-            box.prop(settings, "granular_friction")
-            box.prop(settings, "granular_restitution")
-            box.prop(settings, "granular_rolling_friction")
+            manual.prop(settings, "granular_density")
+            manual.prop(settings, "granular_friction")
+            manual.prop(settings, "granular_restitution")
+            manual.prop(settings, "granular_rolling_friction")
             if settings.granular_source_mode == "FLOW":
                 box.prop(settings, "granular_flow_rate")
                 box.prop(settings, "granular_initial_velocity")
@@ -2220,6 +2536,7 @@ class GRASPH_PT_entities(Panel):
                 row.prop(settings, "granular_end_time")
         if settings.role in {"STATIC", "KINEMATIC", "DYNAMIC_HINGE", "DYNAMIC_BODY"}:
             box = layout.box()
+            box.enabled = settings.physics_material is None
             box.label(text="Surface Material")
             box.prop(settings, "collider_friction")
             box.prop(settings, "collider_restitution")
@@ -2407,6 +2724,14 @@ class GRASPH_PT_project(Panel):
         row = joints.row(align=True)
         row.prop(settings, "new_joint_type", text="")
         row.operator("grasph.add_joint_anchor", text="Add Joint", icon="ADD")
+        fixed = joints.column()
+        fixed.enabled = settings.new_joint_type == 'FIXED'
+        fixed.prop(settings, 'new_joint_breakable')
+        if settings.new_joint_breakable:
+            fixed.prop(settings, 'new_joint_break_force')
+            fixed.prop(settings, 'new_joint_break_torque')
+        fixed.operator('grasph.connect_selected', text='Connect Selected to Active', icon='CONSTRAINT')
+        fixed.label(text='Fixed joints at body midpoints; existing pairs skipped')
 
 
 class GRASPH_PT_output_preview(Panel):
@@ -2444,9 +2769,7 @@ class GRASPH_PT_output_preview(Panel):
             row.enabled = not running
             row.prop(settings, "live_preview_interval")
             row.label(text="%")
-            grain_radius = preview.row()
-            grain_radius.enabled = not running
-            grain_radius.prop(settings, "live_grain_radius")
+            preview.label(text="Grains use their physical particle radii", icon="INFO")
             if settings.live_preview_time > 0.0:
                 preview.label(
                     text=f"t={settings.live_preview_time:.3f}s · "
@@ -2601,7 +2924,7 @@ class GRASPH_PT_granular_display(Panel):
 
     def draw(self, context):
         layout = self.layout
-        layout.label(text="Visual grain size only", icon="INFO")
+        layout.label(text="Physical particle radii from result cache", icon="INFO")
         layout.operator("grasph.refresh_granular_display")
         obj = _find_granular_result(context.scene, context.active_object)
         modifier = _granular_modifier(obj)
@@ -2617,12 +2940,17 @@ class GRASPH_PT_granular_display(Panel):
 
 
 CLASSES = (
+    GraSPHPhysicsMaterial,
+    GRASPH_UL_physics_materials,
+    GRASPH_OT_physics_material,
+    GRASPH_PT_physics_materials,
     GraSPHObjectSettings,
     GraSPHSceneSettings,
     GRASPH_OT_assign_selected,
     GRASPH_OT_quality_preset,
     GRASPH_OT_resume_current_frame,
     GRASPH_OT_add_joint_anchor,
+    GRASPH_OT_connect_selected,
     GRASPH_OT_granular_material_preset,
     GRASPH_OT_validate,
     GRASPH_OT_export,
@@ -2656,6 +2984,8 @@ def register():
         del bpy.types.Scene.grasph_scene
     if hasattr(bpy.types.Object, "grasph"):
         del bpy.types.Object.grasph
+    if hasattr(bpy.types.Material, 'grasph_physics'):
+        del bpy.types.Material.grasph_physics
     for cls in reversed(CLASSES):
         existing = getattr(bpy.types, cls.__name__, None)
         target = existing if existing is not None else cls
@@ -2667,6 +2997,7 @@ def register():
         bpy.utils.register_class(cls)
     bpy.types.Object.grasph = PointerProperty(type=GraSPHObjectSettings)
     bpy.types.Scene.grasph_scene = PointerProperty(type=GraSPHSceneSettings)
+    bpy.types.Material.grasph_physics = PointerProperty(type=GraSPHPhysicsMaterial)
 
 
 def unregister():
@@ -2678,6 +3009,8 @@ def unregister():
         del bpy.types.Scene.grasph_scene
     if hasattr(bpy.types.Object, "grasph"):
         del bpy.types.Object.grasph
+    if hasattr(bpy.types.Material, 'grasph_physics'):
+        del bpy.types.Material.grasph_physics
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
 

@@ -10,7 +10,7 @@ SOLVER_FILES = (
     "grasph.py", "grasph_boundary.py", "grasph_collision.py", "grasph_coupling.py",
     "grasph_free_surface.py", "grasph_granular.py", "grasph_output.py", "grasph_diagnostics.py",
     "grasph_reference.py", "grasph_rigid.py", "grasph_runtime.py", "grasph_scene.py",
-    "grasph_solver.py", "grasph_sph.py",
+    "grasph_solver.py", "grasph_sph.py", "grasph_joints.py",
 )
 PACKAGE_FILES = SOLVER_FILES + (
     "requirements.txt", "requirements-accelerated.txt", "README.md",

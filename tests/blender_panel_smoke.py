@@ -246,7 +246,24 @@ assert fluid_preview is not None
 assert len(fluid_preview.data.vertices) == 2
 assert grain_preview is not None
 assert len(grain_preview.data.vertices) == 1
+assert abs(grain_preview.data.attributes["grasph_radius"].data[0].value - 0.01) < 1e-7
+live_group = grain_preview.modifiers[0].node_group
+assert any(link.to_socket.name == "Scale" and
+           link.from_node.bl_idname == "GeometryNodeInputNamedAttribute"
+           for link in live_group.links)
 assert dynamic.location.z < 0.5
+# Different sizes and changing particle counts must update the same preview.
+with np.load(preview_path) as saved:
+    mixed_preview = {name: saved[name].copy() for name in saved.files}
+mixed_preview["granular_positions"] = np.asarray([[0.2, 0, 1], [0.5, 0, 1]], dtype=np.float32)
+mixed_preview["granular_velocity"] = np.zeros((2, 3), dtype=np.float32)
+mixed_preview["granular_radii"] = np.asarray([0.1, 0.025], dtype=np.float32)
+np.savez(preview_path, **mixed_preview)
+assert addon._update_live_preview(bpy.context.scene, preview_path) == (0.25, 0.25)
+grain_preview = bpy.data.objects[addon._PREVIEW_CLOUDS["granular"]]
+assert len(grain_preview.data.vertices) == 2
+assert np.allclose([item.value for item in grain_preview.data.attributes["grasph_radius"].data],
+                   [0.1, 0.025])
 # Starting a new run must clear old preview objects and snapshots immediately.
 addon._prepare_live_preview_for_run(bpy.context.scene, preview_path)
 assert not preview_path.exists()
@@ -325,7 +342,10 @@ display_module = addon._granular_display_module(bpy.context.scene)
 display_module.add_granular_display(cloud, 0.031)
 display_modifier = cloud.modifiers.get("GraSPH Granular Display")
 assert display_modifier is not None
-assert display_modifier.node_group.get("grasph_granular_display_version") == "0.1.0"
+assert display_modifier.node_group.get("grasph_granular_display_version") == "0.2.0"
+assert any(link.to_socket.name == "Scale" and
+           link.from_node.bl_idname == "GeometryNodeInputRadius"
+           for link in display_modifier.node_group.links)
 print("GraSPH Blender panel smoke test passed:", output)
 
 # A rigid-body-only scene is valid, and reset is available without running.

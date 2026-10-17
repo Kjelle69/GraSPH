@@ -78,6 +78,7 @@ class SceneData:
     hinges: dict
     collider_materials: dict
     dynamic_bodies: dict
+    fixed_joints: tuple = ()
 
     def sim_seconds_to_time_code(self, t_seconds):
         return float(self.start_time_code + float(t_seconds) * self.time_codes_per_second)
@@ -672,6 +673,8 @@ def load_scene(usd_file):
     xcache = UsdGeom.XformCache(ref_time)
     physics_hinge_owners = _physics_hinge_owners(stage)
     for prim in stage.Traverse():
+        if prim.GetAttribute('grasph:fractureGroup').Get():
+            raise ValueError('Legacy Fracture Group is no longer supported: create explicit Joint empties and re-export the scene.')
         if not prim.IsA(UsdGeom.Mesh):
             continue
         vertices = _world_points(prim, ref_time)
@@ -788,6 +791,9 @@ def load_scene(usd_file):
         collider_materials=collider_materials,
         dynamic_bodies=dynamic_bodies,
     )
+
+    from grasph_joints import load_fixed_joints
+    scene.fixed_joints = load_fixed_joints(stage, dynamic_bodies)
 
     motion_t, motion_v, motion_drivers = _sample_motion_tables(
         stage, colliders, reference_linear, reference_translation,

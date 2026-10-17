@@ -310,6 +310,8 @@ def resolve_body_contacts(
             for other_path, collider in collider_by_name.items():
                 if other_path == path:
                     continue
+                if frozenset((path, other_path)) in getattr(scene, "joint_collision_exclusions", ()):
+                    continue
                 # A dynamic pair is solved only once.
                 if (other_path in body_states and path > other_path
                         and getattr(scene.dynamic_bodies[other_path], "joint_type", "free") != "fixed"):
